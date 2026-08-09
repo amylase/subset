@@ -312,6 +312,7 @@ failing rather than disabled, and the review-fix loop is capped at
 `MAX_CI_FEEDBACK_ROUNDS` so a flake cannot send Devin into an unbounded chase.
 
 [PR #1]: https://github.com/amylase/superset/pull/1
+[PR #6]: https://github.com/amylase/superset/pull/6
 
 ---
 
@@ -350,9 +351,10 @@ Stated plainly, because a system whose reporting hides its own gaps is not worth
 - **No per-day billing breakdown.** The enterprise consumption endpoints
   (`/v3/enterprise/consumption/*`) return 403 for an org-scoped service user (verified), so cost is
   built from `acus_consumed` — read per session and reconciled against the Analytics endpoint.
-- **The `repos` value format is unverified.** Devin's documentation gives `repos` no description and
-  no example anywhere; the CLI consistently uses `owner/repo`, which is what is sent here. The first
-  real session settles it by showing which repository was attached.
+- ~~**The `repos` value format is unverified.**~~ **Settled.** Devin's documentation gives `repos`
+  no description and no example anywhere, so `owner/repo` was sent on the strength of the CLI using
+  it. The session read-back does not echo the field at all — the response has no `repos` and no
+  `repo_path` key — so it took a real pull request to confirm: [PR #6] landed on `amylase/superset`.
 - **Server-side tag filtering on Analytics is unverified**, which is why it is not relied on. See
   the note in Observability.
 - **Money and time-saved numbers rest on stated assumptions**, printed on the dashboard rather than
