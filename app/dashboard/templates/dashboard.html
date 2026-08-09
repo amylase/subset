@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Live without JavaScript. The reconcile loop writes state continuously; this just re-reads it. -->
+<meta http-equiv="refresh" content="15">
+<title>Remediation · {{ repo }}</title>
+<style>
+  :root {
+    --bg: #fbfbfd; --panel: #fff; --ink: #16181d; --muted: #6b7280;
+    --line: #e5e7eb; --accent: #1f6feb; --ok: #15803d; --warn: #b45309; --bad: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --panel: #161b22; --ink: #e6edf3; --muted: #8b949e;
+      --line: #262c36; --accent: #4493f8; --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px 24px 56px; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 22px; }
+  h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 12px; }
+  h2 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--muted); margin: 30px 0 10px; }
+
+  .tiles { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(184px, 1fr)); }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .tile .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .tile .value { font-size: 25px; font-weight: 600; margin-top: 6px; letter-spacing: -0.02em; }
+  .tile .note { color: var(--muted); font-size: 11px; margin-top: 3px; }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+
+  /* MTTR split. Deliberately a single thin bar, not a chart library: the point is the ratio. */
+  .split { display: flex; height: 26px; border-radius: 6px; overflow: hidden; border: 1px solid var(--line); }
+  .split div { display: flex; align-items: center; justify-content: center; font-size: 11px;
+               color: #fff; white-space: nowrap; min-width: 0; }
+  .seg-agent { background: #2563eb; } .seg-ci { background: #7c3aed; } .seg-review { background: #b45309; }
+  .legend { display: flex; gap: 18px; margin-top: 10px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+  .legend b { color: var(--ink); font-weight: 600; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; font-weight: 600; color: var(--muted); font-size: 11px;
+       text-transform: uppercase; letter-spacing: .05em; padding: 0 10px 8px; }
+  td { padding: 9px 10px; border-top: 1px solid var(--line); vertical-align: top; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px;
+          font-weight: 600; border: 1px solid transparent; }
+  .s-merged   { color: var(--ok);   background: color-mix(in srgb, var(--ok) 12%, transparent); }
+  .s-pr_open  { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .s-running  { color: var(--muted); background: color-mix(in srgb, var(--muted) 12%, transparent); }
+  .s-pending  { color: var(--muted); background: color-mix(in srgb, var(--muted) 12%, transparent); }
+  .s-blocked, .s-escalated { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+  .s-failed   { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 6px 18px;
+        margin-top: 12px; font-size: 12px; }
+  .kv div { display: flex; justify-content: space-between; gap: 10px;
+            border-bottom: 1px dotted var(--line); padding: 3px 0; }
+  .kv span:last-child { font-variant-numeric: tabular-nums; }
+  footer { margin-top: 26px; color: var(--muted); font-size: 11.5px; }
+  footer li { margin: 2px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Autonomous remediation</h1>
+    <span class="sub">{{ repo }} · refreshes every 15s</span>
+  </header>
+
+  <div class="tiles">
+    <div class="tile">
+      <div class="label">Resolution rate</div>
+      <div class="value">{{ m.resolution_rate | pct }}</div>
+      <div class="note">{{ m.issues_resolved }} of {{ m.issues_total }} issues closed by a merged PR</div>
+    </div>
+    <div class="tile">
+      <div class="label">Time to merge</div>
+      <div class="value">{{ m.durations.total | dur }}</div>
+      <div class="note">p90 {{ m.durations.total_p90 | dur }} · n={{ m.durations.samples }}</div>
+    </div>
+    <div class="tile">
+      <div class="label">Cost per resolution</div>
+      <div class="value">{{ m.cost_per_resolution_usd | usd }}</div>
+      <div class="note">{{ "%.1f"|format(m.acus_total) }} ACU total, incl. {{ "%.1f"|format(m.acus_wasted) }} not merged</div>
+    </div>
+    <div class="tile">
+      <div class="label">Autonomy rate</div>
+      <div class="value">{{ m.autonomy_rate | pct }}</div>
+      <div class="note">completed with zero human intervention</div>
+    </div>
+    <div class="tile">
+      <div class="label">Merge rate</div>
+      <div class="value">{{ m.merge_rate | pct }}</div>
+      <div class="note">merged ÷ opened pull requests</div>
+    </div>
+  </div>
+
+  <h2>Where the time goes</h2>
+  <div class="panel">
+    {% set d = m.durations %}
+    {% set a = d.agent or 0 %}{% set c = d.ci or 0 %}{% set r = d.human_review or 0 %}
+    {% set tot = (a + c + r) or 1 %}
+    <div class="split">
+      <div class="seg-agent" style="width: {{ (100 * a / tot) | round(1) }}%">{{ d.agent | dur }}</div>
+      <div class="seg-ci" style="width: {{ (100 * c / tot) | round(1) }}%">{{ d.ci | dur }}</div>
+      <div class="seg-review" style="width: {{ (100 * r / tot) | round(1) }}%">{{ d.human_review | dur }}</div>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:#2563eb"></i>Devin — <b>{{ d.agent | dur }}</b> label to PR</span>
+      <span><i class="dot" style="background:#7c3aed"></i>CI — <b>{{ d.ci | dur }}</b> PR to checks settled</span>
+      <span><i class="dot" style="background:#b45309"></i>Human review — <b>{{ d.human_review | dur }}</b> checks to merge</span>
+    </div>
+  </div>
+
+  <h2>Issues</h2>
+  <div class="panel">
+    <table>
+      <thead>
+        <tr><th>#</th><th>Issue</th><th>Class</th><th>State</th><th>Session</th><th>PR</th><th class="num">ACU</th></tr>
+      </thead>
+      <tbody>
+      {% for i in issues %}
+        <tr>
+          <td class="num">{{ i.number }}</td>
+          <td>
+            <a href="https://github.com/{{ repo }}/issues/{{ i.number }}">{{ i.title | truncate(64) }}</a>
+            {% if i.structured_output and i.structured_output.outcome %}
+              <div class="sub">outcome: {{ i.structured_output.outcome }}</div>
+            {% endif %}
+          </td>
+          <td>{{ (i.klass or "—") | replace("class:", "") }}</td>
+          <td><span class="pill s-{{ i.derived_state }}">{{ i.derived_state | replace("_", " ") }}</span></td>
+          <td>{% if i.session %}<a href="{{ i.session.url }}">{{ i.session.status or "—" }}{% if i.session.status_detail %}/{{ i.session.status_detail }}{% endif %}</a>{% else %}—{% endif %}</td>
+          <td>{% if i.pull_request %}<a href="{{ i.pull_request.url }}">#{{ i.pull_request.pr_number }}</a>{% else %}—{% endif %}</td>
+          <td class="num">{% if i.session %}{{ "%.2f"|format(i.session.acus) }}{% else %}—{% endif %}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7" style="color:var(--muted)">No issues registered yet. Apply the trigger label to start.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Reliability &amp; interventions</h2>
+  <div class="panel">
+    <details open>
+      <summary>Session outcomes, interventions and operational counters</summary>
+      <div class="kv">
+        {% for k, v in m.session_outcomes.items() %}<div><span>session · {{ k }}</span><span>{{ v }}</span></div>{% endfor %}
+        {% for k, v in m.interventions_by_kind.items() %}<div><span>intervention · {{ k }}</span><span>{{ v }}</span></div>{% endfor %}
+        {% for k, v in m.counters.items() %}<div><span>{{ k | replace("_", " ") }}</span><span>{{ "%g"|format(v) }}</span></div>{% endfor %}
+        <div><span>CI first-pass rate</span><span>{{ m.ci_first_pass_rate | pct }}</span></div>
+        <div><span>interventions per resolution</span><span>{% if m.interventions_per_resolution is not none %}{{ "%.1f"|format(m.interventions_per_resolution) }}{% else %}—{% endif %}</span></div>
+      </div>
+    </details>
+  </div>
+
+  <footer>
+    <strong>Assumptions behind the money figures</strong>
+    <ul>
+      {% for a in m.assumptions %}<li>{{ a }}</li>{% endfor %}
+    </ul>
+  </footer>
+
+</div>
+</body>
+</html>

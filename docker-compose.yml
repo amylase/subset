@@ -1,0 +1,22 @@
+# One service on purpose.
+#
+# The webhook receiver, the dashboard and the reconcile loop share a process and a SQLite file. At
+# this scale a broker and a worker pool would add operational surface without buying anything. The
+# cost is that this runs as a single instance; scaling out would need a real queue and leader
+# election, which is called out as a limitation in the README rather than pretended away.
+
+services:
+  orchestrator:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      DB_PATH: /srv/data/orchestrator.db
+    volumes:
+      - orchestrator-data:/srv/data
+    restart: unless-stopped
+
+volumes:
+  orchestrator-data:
