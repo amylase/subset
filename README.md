@@ -256,15 +256,19 @@ self-contained test file and nothing else, so it is a clean measurement of the f
 | --- | --- |
 | Total checks | 52 |
 | Wall clock | **26 minutes** (versus ~110 upstream — no runner queue contention on a fork) |
-| Failing | `dependency-review`, `playwright-tests (chromium)` + its `-required` anchor |
+| Failed on first attempt | `dependency-review`, `playwright-tests (chromium)` + its `-required` anchor |
 
-`dependency-review` fails for want of repository infrastructure a fork does not have.
-`playwright-tests` fails inside Superset's own soft-delete E2E suite with
-`werkzeug.exceptions.MethodNotAllowed: 405` on `/log/` — a pre-existing failure in the upstream
-suite, unrelated to any change here.
+Re-running both told them apart, which is the whole reason to take a baseline rather than assume:
 
-This baseline is the reason a red check on a remediation PR can be attributed correctly rather than
-guessed at. The failing jobs are left failing rather than disabled.
+- **`dependency-review` — deterministic.** Failed identically on both attempts. It needs repository
+  infrastructure a fork does not have. Expect it red on every remediation PR.
+- **`playwright-tests` — flaky.** Attempt 1 failed inside Superset's own soft-delete E2E suite with
+  `werkzeug.exceptions.MethodNotAllowed: 405` on `/log/`. Attempt 2 passed on the identical commit.
+  A red playwright check on a remediation PR therefore needs a re-run before it means anything.
+
+This is the difference between attributing a red check and guessing at it. The failing job is left
+failing rather than disabled, and the review-fix loop is capped at
+`MAX_CI_FEEDBACK_ROUNDS` so a flake cannot send Devin into an unbounded chase.
 
 [PR #1]: https://github.com/amylase/superset/pull/1
 
