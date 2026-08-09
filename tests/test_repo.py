@@ -30,24 +30,38 @@ def test_recording_the_same_effect_twice_is_harmless(repo: Repo):
 
 def test_the_same_reason_is_flagged_once(repo: Repo):
     seed(repo)
-    assert repo.flag_for_human(2, "blocked") is True
-    assert repo.flag_for_human(2, "blocked") is False
+    assert repo.flag_for_human(2, "blocked") is not None
+    assert repo.flag_for_human(2, "blocked") is None
 
 
 def test_a_different_reason_replaces_the_first(repo: Repo):
     """An operator needs the reason that applies now, not the one that applied first."""
     seed(repo)
     repo.flag_for_human(2, "blocked")
-    assert repo.flag_for_human(2, "cost_halt") is True
+    assert repo.flag_for_human(2, "cost_halt") is not None
     assert repo.issue(2)["needs_human_reason"] == "cost_halt"
 
 
 def test_a_cleared_flag_can_be_raised_again(repo: Repo):
     seed(repo)
-    repo.flag_for_human(2, "blocked")
+    first = repo.flag_for_human(2, "blocked")
     assert repo.clear_human_flag(2) is True
     assert repo.issue(2)["needs_human_at"] is None
-    assert repo.flag_for_human(2, "blocked") is True
+    again = repo.flag_for_human(2, "blocked")
+    assert again is not None
+    # Distinct occurrences, so the comment announcing the second one is not deduplicated against
+    # the first: a problem that comes back after a human cleared it is news again.
+    assert again != first
+
+
+def test_flagging_an_untracked_issue_is_counted_not_swallowed(repo: Repo):
+    """`None` here means two different things; only one of them is normal."""
+    seed(repo)
+    assert repo.flag_for_human(9999, "blocked") is None
+    assert repo.counters()["flag_dropped_unknown_issue"] == 1
+    repo.flag_for_human(2, "blocked")
+    repo.flag_for_human(2, "blocked")
+    assert repo.counters()["flag_dropped_unknown_issue"] == 1
 
 
 def test_an_attempt_is_reserved_before_anything_is_spent(repo: Repo):
@@ -139,7 +153,14 @@ def test_structured_output_is_not_erased_by_a_later_poll(repo: Repo):
     assert '"outcome": "fixed"' in repo.session("s1")["structured_output"]
 
 
-def test_resetting_budgets_clears_nudges_and_the_ci_round(repo: Repo):
+def test_resetting_budgets_moves_the_base_and_never_the_counter(repo: Repo):
+    """The budget refreshes; the totals do not lie about it.
+
+    Rewinding the counters did two kinds of damage. The nudge ordinal is half of an idempotency
+    key, so a rewind regenerated a key already recorded as done and every later nudge was dropped
+    in silence. And `ci_first_pass_rate` reads `ci_rounds == 0`, so a rewind reported a pull
+    request that had failed CI as having passed first time.
+    """
     seed(repo)
     repo.bump_nudges("s1")
     repo.bump_nudges("s1")
@@ -147,8 +168,10 @@ def test_resetting_budgets_clears_nudges_and_the_ci_round(repo: Repo):
     repo.update_pr(10, ci_rounds=3, ci_last_sha="abc")
 
     repo.reset_budgets("s1")
-    assert repo.session("s1")["nudges"] == 0
-    assert repo.pull_request(10)["ci_rounds"] == 0
+    assert repo.session("s1")["nudges"] == 2
+    assert repo.session("s1")["nudge_base"] == 2
+    assert repo.pull_request(10)["ci_rounds"] == 3
+    assert repo.pull_request(10)["ci_rounds_base"] == 3
     assert repo.pull_request(10)["ci_last_sha"] is None
 
 

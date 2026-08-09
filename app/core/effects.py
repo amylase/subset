@@ -36,7 +36,9 @@ class Reason:
     START_FAILED = "start_failed"
     BUDGET_EXHAUSTED = "budget_exhausted"
     PR_CLOSED_UNMERGED = "pr_closed_unmerged"
+    PR_STALE = "pr_stale"
     NOT_FIXED = "not_fixed"
+    INBOX_ABANDONED = "inbox_abandoned"
 
 
 class Effects:
@@ -149,7 +151,8 @@ class Effects:
         per reason — a *different* reason replaces the first and is announced, because "blocked on
         a question" and "out of credits" call for different actions.
         """
-        if not self.repo.flag_for_human(issue_number, reason):
+        at = self.repo.flag_for_human(issue_number, reason)
+        if at is None:
             return False
 
         self.repo.bump(f"flagged:{reason}")
@@ -160,8 +163,12 @@ class Effects:
             + "\n\nReply on this issue and the answer will be forwarded to the session, if it can "
             "still be reached. Re-apply the label to start a fresh attempt."
         )
-        # Keyed on the reason so a later, different reason is also announced.
-        await self.comment(issue_number, body=body, key=f"issue:{issue_number}:flag:{reason}")
+        # Keyed on *this* flagging, not on the reason. A reason that recurs after a human cleared
+        # the flag is news again, and keying on the reason alone announced it with a label and
+        # nothing else — silence on the thread the human is reading.
+        await self.comment(
+            issue_number, body=body, key=f"issue:{issue_number}:flag:{reason}:{int(at)}"
+        )
         try:
             await self.github.add_label(issue_number, self.settings.escalation_label)
         except Exception:

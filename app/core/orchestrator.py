@@ -15,8 +15,17 @@ Resync is not redundant with webhooks: GitHub does not retry failed deliveries, 
 arriving while this process is down is gone for good.
 
 **Scope.** A human watches this run. It is allowed to fail visibly and be restarted; it does not try
-to guarantee exactly-once effects across a crash. What it does guarantee is that it never spends
-twice for one attempt and never stalls invisibly — every dead end raises a flag on the issue.
+to guarantee exactly-once effects across a crash.
+
+Two properties it does hold to, because both were broken once and neither failure was visible:
+
+* **It does not spend twice for one attempt.** The attempt is reserved before the billable call, an
+  ambiguous `POST` is never repeated (`app.clients.http`), and a retry supersedes the session it
+  replaces rather than running alongside it.
+* **It does not stall invisibly.** Every dead end reaches `flag_human`: a session that produced no
+  pull request whatever its stated outcome, a pull request that never moves, feedback that cannot
+  reach a closed session, an inbox item given up on, an exhausted nudge or CI budget. A counter is
+  not an escalation.
 """
 
 from __future__ import annotations
@@ -59,11 +68,13 @@ def parse_pr_number(url: str | None, repo: str) -> int | None:
     """Extract a pull request number, but only for our own repository.
 
     Anchored on purpose: a loose ``/pull/(\\d+)`` search accepts a URL for any repository, and the
-    orchestrator would then act on that number against ours.
+    orchestrator would then act on that number against ours. The trailing ``/pull/`` is part of the
+    anchor because a bare prefix also matches any repository whose name merely *starts* with ours —
+    ``amylase/superset-fork`` would be read as ``amylase/superset``.
     """
     if not url:
         return None
-    if not url.startswith(f"https://github.com/{repo}"):
+    if not url.startswith(f"https://github.com/{repo}/pull/"):
         return None
     match = _PR_URL.search(url)
     return int(match.group(1)) if match else None
@@ -143,8 +154,38 @@ class Orchestrator:
                     item["id"], repr(exc), max_attempts=MAX_INBOX_ATTEMPTS
                 ):
                     self.repo.bump("inbox_abandoned")
+                    await self._abandoned(item, exc)
             else:
                 self.repo.mark_dispatched(item["id"])
+
+    async def _abandoned(self, item: dict[str, Any], exc: Exception) -> None:
+        """Say out loud that a recorded event was given up on.
+
+        The inbox is the only copy of a human's answer or a reviewer's comment — GitHub does not
+        redeliver. Dropping one after three failures and moving on left a person waiting for a
+        reply that would never come, with nothing but a counter to show for it.
+        """
+        number = self._issue_for(item["kind"], item["payload"])
+        if number is None:
+            logger.error("abandoned inbox item %s (%s): %r", item["id"], item["kind"], exc)
+            return
+        await self.effects.flag_human(
+            number,
+            reason=Reason.INBOX_ABANDONED,
+            detail=(
+                f"A `{item['kind']}` event could not be processed after {MAX_INBOX_ATTEMPTS} "
+                f"attempts and has been given up on: `{exc!r}`. Nothing was acted on, so if this "
+                "was a reply to Devin it did not reach the session."
+            ),
+        )
+
+    def _issue_for(self, kind: str, payload: dict[str, Any]) -> int | None:
+        if kind == "issue_labeled":
+            return payload.get("number")
+        if kind == "issue_comment":
+            return payload.get("issue_number")
+        record = self.repo.pull_request(payload.get("pr_number", -1))
+        return record["issue_number"] if record else None
 
     async def _handle(self, kind: str, payload: dict[str, Any]) -> None:
         match kind:
@@ -192,7 +233,30 @@ class Orchestrator:
         self.repo.request_retry(number)
         self.repo.bump("retries_requested")
         await self.effects.clear_human_flag(number)
+        await self._supersede_open_sessions(number)
         logger.info("retry requested for issue #%s", number)
+
+    async def _supersede_open_sessions(self, number: int) -> None:
+        """Stop tracking any session still open on an issue that is about to be retried.
+
+        A retry outranks a running session on purpose (`state.wants_session`), which without this
+        left the previous session billing alongside the new one, holding a concurrency slot and free
+        to open a competing pull request. The v3 API exposes no way to terminate a session — probed:
+        `/terminate` and `/stop` are both 404 — so this is bookkeeping, not a kill. What it buys is
+        real: the session stops being messaged, stops holding a slot, and is marked in the audit
+        trail as superseded rather than silently doubling the spend. It still costs whatever it
+        spends before it sleeps, which is why the per-session ACU cap exists, and the Analytics
+        refresh keeps counting it against the global budget.
+        """
+        for record in self.repo.sessions(number):
+            if liveness(record) is Liveness.CLOSED or record["produced_at"] is not None:
+                # A session that already delivered is left alone: its pull request keeps the issue
+                # in `pr_open`, no new session starts, and closing it here would sever the
+                # review-fix loop that feeds CI failures back to it.
+                continue
+            if self.repo.close_session(record["session_id"], "superseded"):
+                self.repo.bump("sessions_superseded")
+                logger.info("session %s superseded by a retry of #%s", record["session_id"], number)
 
     # -- pass 2: start sessions --------------------------------------------
 
@@ -226,6 +290,10 @@ class Orchestrator:
                 return
 
             active += 1
+            # Count what this session is *allowed* to spend, not what it has spent. A fresh session
+            # reports 0 ACU until its first poll, so a budget read once per tick let a whole tick's
+            # worth of sessions start against a figure none of them had moved yet.
+            spent += self.settings.max_acu_per_session
             try:
                 await self._create_session(issue)
             except Exception:
@@ -283,15 +351,20 @@ class Orchestrator:
     async def track_sessions(self) -> None:
         max_age = self.settings.max_session_age_hours * 3600
         for ctx in self.contexts():
-            if ctx["status"] is IssueStatus.MERGED:
-                # The outcome is settled; nothing a session does now changes it.
-                continue
+            # A merged issue is settled, so nothing here acts on it — but its sessions are still
+            # polled. One that is somehow still running is spending real money, and dropping it
+            # from the poll meant the last figure recorded for it was whatever it happened to
+            # report before the merge.
+            settled = ctx["status"] is IssueStatus.MERGED
             for record in ctx["sessions"]:
                 if liveness(record) is Liveness.CLOSED:
                     continue
                 # The backstop for anything the status vocabulary does not express: an unrecognised
-                # status, or a session that rests indefinitely having produced nothing.
-                if now() - record["created_at"] > max_age:
+                # status, or a session that rests indefinitely having produced nothing. A session
+                # that *has* produced is exempt: it is sleeping next to an open pull request,
+                # waiting for CI or a reviewer, and closing it there would both raise a false alarm
+                # and sever the review-fix loop. The pull request's own staleness bound covers it.
+                if record["produced_at"] is None and now() - record["created_at"] > max_age:
                     self.repo.close_session(record["session_id"], "timeout")
                     self.repo.bump("sessions_timed_out")
                     await self.effects.flag_human(
@@ -305,11 +378,11 @@ class Orchestrator:
                     )
                     continue
                 try:
-                    await self._advance_session(record)
+                    await self._advance_session(record, act=not settled)
                 except Exception:
                     logger.exception("advancing session %s failed", record["session_id"])
 
-    async def _advance_session(self, record: dict[str, Any]) -> None:
+    async def _advance_session(self, record: dict[str, Any], *, act: bool = True) -> None:
         session_id = record["session_id"]
         remote = await self.devin.get_session(session_id)
 
@@ -342,11 +415,18 @@ class Orchestrator:
             self._link_pull_requests(record, pulls)
 
         current = self.repo.session(session_id) or record
+        if not act:
+            # The issue is settled. The poll above is what we came for: an accurate status and an
+            # accurate ACU figure. Everything below writes to GitHub or spends, so it stops here.
+            return
 
         if produced:
             await self._report_completion(current, structured, pulls)
             outcome = structured.get("outcome") if isinstance(structured, dict) else None
-            if outcome in ("could_not_fix", "partially_fixed") and not pulls:
+            if not pulls:
+                # Any outcome without a pull request needs a human, including `fixed`. Restricting
+                # this to the two admitted failures let the worst version through untouched: a
+                # session reporting success with nothing to show for it, parked in `exhausted`.
                 await self.effects.flag_human(
                     record["issue_number"],
                     reason=Reason.NOT_FIXED,
@@ -391,16 +471,18 @@ class Orchestrator:
                 self.repo.bump("prs_opened")
 
     async def _handle_blocked(self, session: dict[str, Any]) -> None:
-        if session["nudges"] < self.settings.max_nudges:
-            # Keyed on the session and the nudge ordinal. The ordinal only ever increases here;
-            # a human reply resets the budget, and the reset also clears the recorded keys' effect
-            # by moving the ordinal forward — see `reset_budgets`.
+        spent = session["nudges"] - session["nudge_base"]
+        if spent < self.settings.max_nudges:
+            # Keyed on the ordinal, which only ever increases — a human reply moves `nudge_base`,
+            # never `nudges`. When the reset rewound the counter instead, the key regenerated to one
+            # already recorded as done, every later nudge was dropped as a duplicate, the budget
+            # never advanced, and the escalation below became unreachable for the life of the
+            # session.
             sent = await self.effects.message_session(
                 session,
                 reason="auto_nudge",
                 body=prompts.nudge_message(),
-                key=f"session:{session['session_id']}:nudge:{session['nudges'] + 1}:"
-                f"{int(session['created_at'])}",
+                key=f"session:{session['session_id']}:nudge:{session['nudges'] + 1}",
             )
             if sent:
                 self.repo.bump_nudges(session["session_id"])
@@ -488,12 +570,34 @@ class Orchestrator:
 
         sha = pull["head"]["sha"]
         settled, conclusion = await self.github.checks_settled(sha)
-        if settled:
-            # Rewritten each time, not once: after a self-correction round the earlier verdict is
-            # stale, and freezing it made every later CI wait look like human review time.
-            self.repo.update_pr(number, ci_settled_at=now(), ci_conclusion=conclusion)
+        if settled and record["ci_settled_sha"] != sha:
+            # Stamped once per commit. After a self-correction round the earlier verdict is stale,
+            # so a new head sha re-stamps — but a stamp rewritten on every poll tracks *now*, and
+            # the CI slice then swallowed however long a human took to review.
+            self.repo.update_pr(
+                number, ci_settled_at=now(), ci_settled_sha=sha, ci_conclusion=conclusion
+            )
+        elif settled and record["ci_conclusion"] != conclusion:
+            self.repo.update_pr(number, ci_conclusion=conclusion)
         if settled and conclusion == "failure":
             await self._feed_ci_failure(number, sha)
+            return
+
+        opened = record["opened_at"]
+        if opened is not None and now() - opened > self.settings.pr_stale_hours * 3600:
+            # Neither merged nor closed nor failing, for long enough that nothing is going to move
+            # it without a person. Without this bound an issue sits in `pr_open` forever: its
+            # session has produced, so the session watchdog exempts it, and nothing else is
+            # watching.
+            await self.effects.flag_human(
+                record["issue_number"],
+                reason=Reason.PR_STALE,
+                detail=(
+                    f"{record['url']} has been open for over "
+                    f"{self.settings.pr_stale_hours:.0f}h without merging. Review it, or close it "
+                    "and re-apply the label to try again."
+                ),
+            )
 
     # -- the review-fix loop ------------------------------------------------
 
@@ -514,7 +618,7 @@ class Orchestrator:
             self.repo.bump("ci_feedback_deduped")
             return
 
-        if record["ci_rounds"] >= self.settings.max_ci_feedback_rounds:
+        if record["ci_rounds"] - record["ci_rounds_base"] >= self.settings.max_ci_feedback_rounds:
             await self._flag_ci_unresolved(record, session)
             return
 
@@ -567,16 +671,33 @@ class Orchestrator:
         if not session:
             return
 
-        await self.effects.message_session(
+        # Namespaced: issue-comment ids and pull-request-review-comment ids are separate GitHub
+        # sequences and do collide numerically, which under one key format silently dropped
+        # whichever arrived second as a duplicate.
+        if await self.effects.message_session(
             session,
             reason="review_feedback",
             body=prompts.review_feedback_message(
                 pr_url=record["url"] or "", reviewer=author, comment=comment
             ),
-            key=f"comment:{comment_id}",
+            key=f"review_comment:{comment_id}",
             respect_grace=False,
             issue_number=record["issue_number"],
-        )
+        ):
+            return
+        if liveness(session) is Liveness.CLOSED:
+            # Symmetric with a human reply that cannot be delivered: the reviewer is waiting for a
+            # response that is never coming, so say so where they are looking.
+            self.repo.bump("review_feedback_undeliverable")
+            await self.effects.comment(
+                record["issue_number"] or pr_number,
+                body=(
+                    f"⚠️ Review feedback on {record['url']} could not be delivered: the Devin "
+                    "session that opened it is closed and cannot be revived. Re-apply the label to "
+                    "start a fresh attempt."
+                ),
+                key=f"review_comment:{comment_id}:undeliverable",
+            )
 
     async def _forward_reply(
         self, issue_number: int, author: str, comment: str, comment_id: int
@@ -594,7 +715,7 @@ class Orchestrator:
             session,
             reason="human_reply",
             body=prompts.human_reply_message(author=author, comment=comment),
-            key=f"comment:{comment_id}",
+            key=f"issue_comment:{comment_id}",
             respect_grace=False,
         )
         if sent:
@@ -609,7 +730,7 @@ class Orchestrator:
                     "⚠️ That reply could not be delivered: the Devin session is closed and cannot "
                     "be revived. Re-apply the label to start a fresh attempt."
                 ),
-                key=f"comment:{comment_id}:undeliverable",
+                key=f"issue_comment:{comment_id}:undeliverable",
             )
 
     # -- pass 5: recovery and analytics ------------------------------------

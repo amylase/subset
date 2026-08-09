@@ -6,6 +6,7 @@ import pytest
 from fastapi import FastAPI
 
 from app.config import Settings
+from app.core import effects as effects_module
 from app.core import orchestrator as orchestrator_module
 from app.core.effects import Effects
 from app.core.orchestrator import Orchestrator
@@ -28,11 +29,20 @@ class Clock:
     guards for the whole nudge/escalate/reply surface — a real `Settings` object carrying a
     guard-disabling value is a stub by another name. Advancing time deliberately is the honest
     equivalent, and it is what lets the grace window itself be tested.
+
+    **Every module that reads `now` must be patched, or the same guard goes off by a subtler
+    route.** `from app.db.repo import now` makes a fresh binding per module, and `Effects` — the
+    only reader of the grace window — was missed. `last_message_at` was written from this clock at
+    t=1e6 while `in_grace` compared against the real one at t≈1.8e9, so every message looked 54
+    years old and the window was never once closed in the whole suite. `test_no_unpatched_clock`
+    holds the list to what actually exists.
     """
+
+    MODULES = (repo_module, orchestrator_module, effects_module)
 
     def __init__(self, monkeypatch, start: float = 1_000_000.0) -> None:
         self.t = start
-        for module in (repo_module, orchestrator_module):
+        for module in self.MODULES:
             monkeypatch.setattr(module, "now", lambda: self.t)
 
     def advance(self, seconds: float) -> None:

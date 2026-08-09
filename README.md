@@ -200,6 +200,9 @@ python scripts/bootstrap_devin.py
 | `GLOBAL_ACU_BUDGET` | `250` | Total spend ceiling |
 | `MAX_NUDGES` | `2` | Automatic nudges before escalating to a human |
 | `MAX_CI_FEEDBACK_ROUNDS` | `3` | Self-correction attempts before escalating |
+| `MESSAGE_GRACE_SECONDS` | `120` | Quiet window after messaging a session, before its state is read again |
+| `MAX_SESSION_AGE_HOURS` | `12` | Backstop for a session that produced nothing |
+| `PR_STALE_HOURS` | `24` | How long a green, unmerged pull request may sit before a human is asked |
 | `ADMIN_TOKEN` | unset | Enables `/api/admin/*`; disabled when unset |
 
 ### Exposing the webhook
@@ -229,7 +232,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-238 tests covering the orchestrator itself, with no network and no credentials required:
+270 tests covering the orchestrator itself, with no network and no credentials required:
 
 - **The loop, end to end** — label → session → pull request → completion comment → merge, driven
   against recording doubles and a real database. Also: the concurrency cap actually holding back a
@@ -242,9 +245,18 @@ pytest
 - **Receiver behaviour** — redelivery with the same GUID creates one session, not two; non-trigger
   labels and non-`labeled` actions do nothing; another repository is ignored even when correctly
   signed; only trusted `author_association` values can put text in front of the agent.
-- **Clients** — retry, exponential backoff, `Retry-After`, 4xx raised rather than swallowed;
-  check-run pagination and every failing conclusion; the create-session payload, including the tags;
-  the message-list shape.
+- **Clients** — retry, exponential backoff, `Retry-After`, 4xx raised rather than swallowed; a
+  `POST` never repeated after an ambiguous failure but still repeated on `429`; check-run pagination
+  and every failing conclusion; the create-session payload, including the tags; the message-list
+  shape. Method parity between each real client and its double is derived from the application's own
+  call sites by reading the source, not from a list kept by hand.
+- **The grace window** — a second message inside the window deferred, the same message after it
+  delivered, a human reply exempt. Its absence was the suite's worst blind spot: the fixture patched
+  the clock in two modules and missed the one that reads the window, so the guard was open in every
+  test. A structural test now fails if a new module reads `now` without being patched.
+- **Dead ends** — every one of them asserted to reach the issue thread, not a counter: an outcome
+  with no pull request, a pull request that never moves, CI feedback and reviewer feedback that
+  cannot reach a closed session, an abandoned inbox item, a session superseded by a retry.
 - **State interpretation** — a finished task still reports `running`; a suspended session is asleep,
   not failed; an unknown suspension degrades to sleep rather than inflating the failure rate.
 - **Policy** — every cap pinned at its boundary.
@@ -322,10 +334,17 @@ Stated plainly, because a system whose reporting hides its own gaps is not worth
   This is deliberate: the exactly-once machinery it replaced derived keys from mutable counters
   and could wedge an issue permanently, which is a worse failure in a system a human watches.
   Session creation is protected separately, by incrementing the attempt before it spends.
-- **A retry request outranks a running session.** Re-applying the label starts a fresh attempt
-  even if the previous session is still working; the old session is not stopped, because the
-  v3 API exposes no terminate (probed: `/terminate` and `/stop` are 404). It sleeps at ~0.1 ACU
-  and is capped by `MAX_ACU_PER_SESSION`, so the cost is bounded but not zero.
+- **A superseded session cannot actually be killed.** Re-applying the label starts a fresh
+  attempt even if the previous session is still working. That session is marked `superseded`,
+  freeing its concurrency slot and stopping all further messages to it, but the v3 API exposes
+  no terminate — probed: `/terminate` and `/stop` are both 404 — so it keeps running until it
+  sleeps. It sleeps at ~0.1 ACU, is capped by `MAX_ACU_PER_SESSION`, and its spend still
+  reaches the global budget through the Analytics refresh. Bounded, not free.
+- **A `POST` is never retried after an ambiguous failure.** A 502 or a read timeout on session
+  creation says nothing about whether the origin acted, so it is surfaced rather than repeated;
+  the issue is flagged and a human re-applies the label. `429` is the exception — that request
+  was refused before it ran. The cost of this is a rare manual retry; the cost of the
+  alternative was up to five billable sessions for one attempt, four of them untracked.
 - **Polling, not push.** No Devin push callbacks were found in the v3 documentation, so session
   state is pulled on a 10-second cadence, as the official examples do.
 - **No per-day billing breakdown.** The enterprise consumption endpoints
@@ -366,5 +385,5 @@ app/
     schema.sql  repo.py   SQLite; timestamps are the point
 scripts/
   bootstrap_devin.py      register the playbook and the weekly schedule
-tests/                    238 tests, no network required
+tests/                    270 tests, no network required
 ```

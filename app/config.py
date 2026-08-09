@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     #: session holds a concurrency slot and is polled indefinitely.
     max_session_age_hours: float = 12.0
 
+    #: How long a pull request may sit open, green and unmerged before a human is asked to look.
+    #: The session behind it has produced and is exempt from the age watchdog, so this is the only
+    #: thing standing between "waiting for review" and "forgotten".
+    pr_stale_hours: float = 24.0
+
     # --- loop cadence (seconds) -------------------------------------------
     session_poll_interval: float = 10.0
     pr_poll_interval: float = 60.0

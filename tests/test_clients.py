@@ -87,6 +87,69 @@ async def test_a_404_is_raised_immediately(sleeps):
     assert sleeps == []
 
 
+async def test_a_post_is_not_repeated_after_an_ambiguous_failure(sleeps):
+    """The single most expensive bug the retry layer can have.
+
+    `POST /sessions` costs money. A 502 from an edge, or a read timeout while Devin provisions, says
+    nothing about whether the origin already created the session — retrying it made up to five real
+    sessions for one attempt, of which the orchestrator recorded only the last. The rest were never
+    polled, never closed, and invisible to the ACU budget.
+    """
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(502, text="bad gateway")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ApiError):
+            await request_with_retry(client, "POST", "https://x/sessions")
+    assert len(seen) == 1
+    assert sleeps == []
+
+
+async def test_a_post_is_not_repeated_after_a_timeout(sleeps):
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        raise httpx.ReadTimeout("too slow", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(httpx.ReadTimeout):
+            await request_with_retry(client, "POST", "https://x/sessions")
+    assert len(seen) == 1
+
+
+async def test_a_rate_limited_post_is_repeated(sleeps):
+    """429 is the exception: the request was refused before it ran, so repeating it is free."""
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if len(seen) < 3:
+            return httpx.Response(429, headers={"Retry-After": "1"})
+        return httpx.Response(200, json={"session_id": "devin-1"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await request_with_retry(client, "POST", "https://x/sessions")
+    assert response.json()["session_id"] == "devin-1"
+    assert len(seen) == 3
+
+
+async def test_a_get_is_still_repeated_after_a_5xx(sleeps):
+    """The gate is on the method, not on retrying in general — polling must survive a blip."""
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"ok": True}) if len(seen) > 2 else httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert (await request_with_retry(client, "GET", "https://x/y")).json() == {"ok": True}
+    assert len(seen) == 3
+
+
 # --- GitHub: the gate for the whole review-fix loop -------------------------
 
 
@@ -298,30 +361,52 @@ def test_the_fakes_mirror_the_real_client_signatures():
             assert inspect.iscoroutinefunction(getattr(real, name)), name
 
 
-def test_every_client_method_the_orchestrator_calls_exists_on_a_fake():
-    """The integration suite only proves anything about methods the fakes actually implement."""
+def _client_call_sites() -> dict[str, set[str]]:
+    """Every ``self.devin.X(...)`` / ``self.github.X(...)`` the application actually makes.
+
+    Read from the source rather than kept by hand: a hand-written list asserts what someone
+    remembered, and the thing being guarded against is precisely a call site nobody remembered.
+    """
+    import ast
+    import pathlib
+
+    import app
+
+    found: dict[str, set[str]] = {"devin": set(), "github": set()}
+    for path in pathlib.Path(app.__file__).parent.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            fn = node.func if isinstance(node, ast.Call) else None
+            if (
+                isinstance(fn, ast.Attribute)
+                and isinstance(fn.value, ast.Attribute)
+                and fn.value.attr in found
+            ):
+                found[fn.value.attr].add(fn.attr)
+    return found
+
+
+def test_every_client_method_the_application_calls_exists_on_the_real_client_and_its_fake():
+    """Both halves, from one list, because each half fails differently.
+
+    Missing on the fake, the integration suite proves nothing about that path. Missing on the real
+    client, production raises on a call the suite says works — renaming `GitHubClient.comment` used
+    to leave 238 tests green while every comment the system writes would have crashed.
+    """
+    import inspect
+
     from tests.fakes import FakeDevin, FakeGitHub
 
-    used = {
-        FakeDevin: {
-            "create_session",
-            "get_session",
-            "send_message",
-            "latest_devin_message",
-            "insights",
-        },
-        FakeGitHub: {
-            "whoami",
-            "get_issue",
-            "list_issues_with_label",
-            "comment",
-            "add_label",
-            "remove_label",
-            "get_pull",
-            "checks_settled",
-            "failed_check_summary",
-        },
-    }
-    for fake, names in used.items():
-        missing = names - set(vars(fake))
-        assert not missing, f"{fake.__name__} is missing {sorted(missing)}"
+    calls = _client_call_sites()
+    assert calls["devin"] and calls["github"], "the source scan found nothing; it has drifted"
+
+    for attr, real, fake in (
+        ("devin", DevinClient, FakeDevin),
+        ("github", GitHubClient, FakeGitHub),
+    ):
+        for name in sorted(calls[attr]):
+            assert hasattr(real, name), f"{real.__name__} has no {name}(), but the app calls it"
+            assert hasattr(fake, name), f"{fake.__name__} is missing {name}()"
+            assert (
+                inspect.signature(getattr(fake, name)).parameters
+                == inspect.signature(getattr(real, name)).parameters
+            ), f"{fake.__name__}.{name} has drifted from {real.__name__}"

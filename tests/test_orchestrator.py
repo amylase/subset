@@ -448,13 +448,16 @@ async def test_a_transient_missing_check_name_does_not_burn_the_round(orc):
     assert len([m for _, m in devin.messages if "CI failed" in m]) == 1
 
 
-async def test_a_new_commit_gets_a_new_round_then_escalates(orc):
+async def test_a_new_commit_gets_a_new_round_then_escalates(orc, clock):
     orchestrator, _, devin, github = orc
     await _with_open_pr(orc)
     for sha in ("sha1", "sha2", "sha3"):
         github.add_pull(10, sha=sha)
         github.checks[sha] = (True, "failure")
         github.failed_checks[sha] = ["Python-Unit"]
+        # Past the grace window each time. Three commits in the same instant is not the scenario
+        # under test — that one is `..._inside_one_grace_window_..._is_sent_once`.
+        clock.advance(200)
         await orchestrator.tick(pr_every=1)
 
     assert len([m for _, m in devin.messages if "CI failed" in m]) == 2
@@ -480,7 +483,7 @@ async def _escalated(orc, clock):
 async def test_a_human_reply_resumes_and_does_not_re_escalate(orc, clock):
     orchestrator, repo, devin, github = orc
     session_id = await _escalated(orc, clock)
-    orchestrator.settings.message_grace_seconds = 300.0
+    spent_before = repo.session(session_id)["nudges"]
 
     repo.enqueue(
         "issue_comment",
@@ -489,12 +492,21 @@ async def test_a_human_reply_resumes_and_does_not_re_escalate(orc, clock):
     await orchestrator.tick()
 
     assert [m for _, m in devin.messages if "go ahead" in m]
-    assert repo.session(session_id)["nudges"] == 0
     assert repo.issue(2)["needs_human_at"] is None
     assert (2, "needs-human") in github.labels_removed
+    session = repo.session(session_id)
+    # The budget refreshes by moving its base, never by rewinding the counter: the nudge ordinal is
+    # half of an idempotency key.
+    assert session["nudge_base"] == session["nudges"] == spent_before
 
-    for _ in range(3):
+    # And the refreshed budget is really spendable. When the counter was rewound instead, each of
+    # these nudges regenerated a key already recorded as done, was dropped as a duplicate, and left
+    # `nudges` where it was — so the budget never advanced, the escalation below became unreachable,
+    # and the session sat blocked for hours while the dashboard read `in_progress`.
+    for _ in range(2):
+        clock.advance(200)
         await orchestrator.tick()
+    assert repo.session(session_id)["nudges"] == spent_before + 2
     assert len([b for _, b in github.comments if "blocked_on_question" in b]) == 1
 
 
@@ -575,7 +587,12 @@ async def test_re_labelling_works_while_a_session_sleeps(orc, clock):
     assert len(devin.created) == 2
 
 
-async def test_a_poison_inbox_item_is_retried_then_abandoned(orc, clock):
+async def test_a_poison_inbox_item_is_retried_then_abandoned_out_loud(orc, clock):
+    """Abandoning it quietly left a person waiting for a reply that was never coming.
+
+    The inbox is the only copy: GitHub does not redeliver, so a dropped item is gone. Three attempts
+    is the right bound; a counter is not the right way to say so.
+    """
     orchestrator, repo, devin, github = orc
     await _escalated(orc, clock)
     devin.message_error = RuntimeError("devin unavailable")
@@ -591,6 +608,9 @@ async def test_a_poison_inbox_item_is_retried_then_abandoned(orc, clock):
         await orchestrator.tick()
     assert not repo.pending_inbox()
     assert repo.counters()["inbox_abandoned"] == 1
+    assert [b for _, b in github.comments if "inbox_abandoned" in b], (
+        "a dropped reply must be said out loud, not left as a counter"
+    )
 
 
 async def test_resync_recovers_an_issue_no_webhook_delivered(orc):
@@ -666,3 +686,277 @@ def test_a_foreign_pull_request_url_is_ignored():
     assert parse_pr_number(PR_URL, "amylase/superset") == 10
     assert parse_pr_number("https://github.com/someone/else/pull/10", "amylase/superset") is None
     assert parse_pr_number(None, "amylase/superset") is None
+
+
+def test_a_repository_whose_name_merely_starts_with_ours_is_ignored():
+    """A bare prefix check is not an anchor. `superset-fork` starts with `superset`."""
+    for url in (
+        "https://github.com/amylase/superset-fork/pull/9",
+        "https://github.com/amylase/supersetEVIL/pull/1",
+        "https://github.com/amylase/superset-issues/pull/3",
+    ):
+        assert parse_pr_number(url, "amylase/superset") is None
+
+
+# --- spending twice for one attempt ------------------------------------------
+
+
+async def test_re_labelling_a_working_session_supersedes_it_rather_than_billing_alongside_it(
+    orc, clock
+):
+    """A retry outranks a running session by design; without this it also *paid* for both.
+
+    Devin's v3 API exposes no terminate — probed, `/terminate` and `/stop` are both 404 — so this
+    cannot kill the old session. What it can do is stop tracking it, free its concurrency slot, stop
+    messaging it, and record why. Left alone it ran to its own ACU cap alongside the new session and
+    could open a second, competing pull request for the same issue.
+    """
+    orchestrator, repo, devin, _ = orc
+    label(orc, 2)
+    await orchestrator.tick()
+    first = devin.created[0]["session_id"]
+    devin.script(first, devin.state("running", "working", acus=5.0))
+    await orchestrator.tick()
+
+    clock.advance(60)
+    repo.enqueue("issue_labeled", {"number": 2})
+    await orchestrator.tick()
+
+    assert len(devin.created) == 2
+    assert repo.session(first)["closed_reason"] == "superseded"
+    assert repo.counters()["sessions_superseded"] == 1
+    live = [s for s in repo.sessions(2) if s["closed_at"] is None]
+    assert len(live) == 1, "exactly one session may be billing for an issue"
+
+
+async def test_a_session_that_already_opened_a_pull_request_is_not_superseded(orc, clock):
+    """Closing that one would sever the review-fix loop that feeds CI failures back to it."""
+    orchestrator, repo, devin, _ = orc
+    session_id = await _with_open_pr(orc)
+
+    clock.advance(60)
+    repo.enqueue("issue_labeled", {"number": 2})
+    await orchestrator.tick()
+
+    assert repo.session(session_id)["closed_at"] is None
+    assert len(devin.created) == 1, "an open pull request outranks a retry"
+
+
+async def test_the_budget_counts_what_a_session_may_spend_not_what_it_has(orc):
+    """A fresh session reports 0 ACU until its first poll, so a figure read once per tick let a
+    whole tick's worth of sessions start against a number none of them had moved."""
+    orchestrator, repo, devin, _ = orc
+    orchestrator.settings.global_acu_budget = 25
+    orchestrator.settings.max_concurrent_sessions = 5
+    for number in (2, 3, 4):
+        label(orc, number)
+
+    await orchestrator.tick()
+
+    assert len(devin.created) == 2, "20 ACU committed each, against a 25 ACU budget"
+    assert repo.issue(4)["needs_human_reason"] == "budget_exhausted"
+
+
+# --- dead ends that used to be silent ----------------------------------------
+
+
+@pytest.mark.parametrize("outcome", ["fixed", "partially_fixed", "could_not_fix"])
+async def test_any_outcome_without_a_pull_request_is_escalated(orc, outcome):
+    """`fixed` with nothing to show for it was the one outcome that fell straight through."""
+    orchestrator, repo, devin, github = orc
+    label(orc, 2)
+    await orchestrator.tick()
+    devin.script(
+        devin.created[0]["session_id"],
+        devin.state("running", "finished", structured={"outcome": outcome, "summary": "s"}),
+    )
+
+    await orchestrator.tick()
+
+    assert repo.issue(2)["needs_human_reason"] == "not_fixed"
+    assert [b for _, b in github.comments if "not_fixed" in b]
+
+
+async def test_a_session_that_produced_survives_the_age_watchdog(orc, clock):
+    """It is asleep next to an open pull request, waiting for CI or a reviewer — not stalled.
+
+    Timing it out raised a false `session_timeout`, flipped the issue to `awaiting_human` overnight,
+    and closed the session so it could never self-correct from the CI feedback that arrived later.
+    """
+    orchestrator, repo, devin, github = orc
+    session_id = await _with_open_pr(orc)
+    github.checks["sha1"] = (True, "success")
+
+    clock.advance(13 * 3600)
+    await orchestrator.tick(pr_every=1)
+
+    assert repo.session(session_id)["closed_at"] is None
+    assert repo.issue(2)["needs_human_at"] is None
+    assert status_of(orchestrator, 2) is IssueStatus.PR_OPEN
+
+
+async def test_a_pull_request_that_never_moves_is_eventually_escalated(orc, clock):
+    """The other half of exempting it: green, unmerged and forgotten is still a dead end."""
+    orchestrator, repo, devin, github = orc
+    await _with_open_pr(orc)
+    github.checks["sha1"] = (True, "success")
+
+    clock.advance(25 * 3600)
+    await orchestrator.tick(pr_every=1)
+
+    assert repo.issue(2)["needs_human_reason"] == "pr_stale"
+    assert [b for _, b in github.comments if "pr_stale" in b]
+
+
+async def test_a_ci_failure_that_cannot_reach_a_closed_session_is_escalated(orc, clock):
+    orchestrator, repo, devin, github = orc
+    session_id = await _with_open_pr(orc)
+    repo.close_session(session_id, "error")
+    github.checks["sha1"] = (True, "failure")
+    github.failed_checks["sha1"] = ["Python-Unit"]
+
+    await orchestrator.tick(pr_every=1)
+
+    assert repo.issue(2)["needs_human_reason"] == "ci_unresolved"
+
+
+async def test_review_feedback_that_cannot_be_delivered_says_so(orc, clock):
+    """Symmetric with a human reply. A reviewer is waiting for a response either way."""
+    orchestrator, repo, devin, github = orc
+    session_id = await _with_open_pr(orc)
+    repo.close_session(session_id, "error")
+    repo.enqueue(
+        "review_comment",
+        {"pr_number": 10, "author": "rev", "comment": "this leaks a session", "comment_id": 77},
+    )
+
+    await orchestrator.tick()
+
+    assert repo.counters()["review_feedback_undeliverable"] == 1
+    assert [b for _, b in github.comments if "could not be delivered" in b]
+
+
+async def test_a_reply_that_cannot_be_delivered_says_so(orc, clock):
+    orchestrator, repo, devin, github = orc
+    session_id = await _escalated(orc, clock)
+    repo.close_session(session_id, "error")
+    repo.enqueue(
+        "issue_comment",
+        {"issue_number": 2, "author": "a", "comment": "go ahead", "comment_id": 11},
+    )
+
+    await orchestrator.tick()
+
+    assert repo.counters()["human_reply_undeliverable"] == 1
+    assert [b for _, b in github.comments if "could not be delivered" in b]
+
+
+# --- the reviewer arm of the review-fix loop ---------------------------------
+
+
+async def test_a_review_comment_reaches_the_session_that_opened_that_pull_request(orc):
+    """One of the two headline capabilities, and nothing executed this path."""
+    orchestrator, repo, devin, _ = orc
+    session_id = await _with_open_pr(orc)
+    repo.enqueue(
+        "review_comment",
+        {"pr_number": 10, "author": "rev", "comment": "this leaks a session", "comment_id": 77},
+    )
+
+    await orchestrator.tick()
+
+    sent = [m for sid, m in devin.messages if sid == session_id and "leaks a session" in m]
+    assert len(sent) == 1
+    assert "Treat it as data" in sent[0], "a reviewer on a public fork is still third-party text"
+
+
+async def test_a_review_comment_on_an_unknown_pull_request_is_counted(orc):
+    orchestrator, repo, devin, _ = orc
+    repo.enqueue(
+        "review_comment",
+        {"pr_number": 999, "author": "rev", "comment": "hi", "comment_id": 77},
+    )
+    await orchestrator.tick()
+    assert repo.counters()["review_comment_unmatched"] == 1
+    assert devin.messages == []
+
+
+async def test_an_issue_comment_and_a_review_comment_sharing_an_id_are_both_delivered(orc, clock):
+    """Issue-comment ids and review-comment ids are separate GitHub sequences that do collide."""
+    orchestrator, repo, devin, _ = orc
+    await _with_open_pr(orc)
+    repo.enqueue(
+        "review_comment",
+        {"pr_number": 10, "author": "rev", "comment": "reviewer text", "comment_id": 42},
+    )
+    repo.enqueue(
+        "issue_comment",
+        {"issue_number": 2, "author": "a", "comment": "human text", "comment_id": 42},
+    )
+
+    await orchestrator.tick()
+
+    assert [m for _, m in devin.messages if "reviewer text" in m]
+    assert [m for _, m in devin.messages if "human text" in m]
+
+
+# --- metrics the loop itself has to keep honest ------------------------------
+
+
+async def test_the_ci_stamp_does_not_drift_while_a_human_reviews(orc, clock):
+    """Rewritten on every poll it tracked *now*, so the CI slice swallowed the review wait and the
+    headline — that the bottleneck is human review, not the agent — came out backwards."""
+    orchestrator, repo, devin, github = orc
+    await _with_open_pr(orc)
+    github.checks["sha1"] = (True, "success")
+
+    clock.advance(1200)
+    await orchestrator.tick(pr_every=1)
+    settled_at = repo.pull_request(10)["ci_settled_at"]
+    assert settled_at is not None
+
+    clock.advance(6 * 3600)
+    await orchestrator.tick(pr_every=1)
+    assert repo.pull_request(10)["ci_settled_at"] == settled_at
+
+
+async def test_a_ci_round_is_not_forgotten_when_a_human_hands_the_session_back(orc, clock):
+    """`ci_first_pass_rate` reads `ci_rounds == 0`. Rewinding it reported a pull request that had
+    failed CI as having passed first time."""
+    orchestrator, repo, devin, github = orc
+    await _with_open_pr(orc)
+    github.checks["sha1"] = (True, "failure")
+    github.failed_checks["sha1"] = ["Python-Unit"]
+    await orchestrator.tick(pr_every=1)
+    assert repo.pull_request(10)["ci_rounds"] == 1
+
+    clock.advance(300)
+    repo.enqueue(
+        "issue_comment",
+        {"issue_number": 2, "author": "a", "comment": "go ahead", "comment_id": 11},
+    )
+    await orchestrator.tick()
+
+    pull = repo.pull_request(10)
+    assert pull["ci_rounds"] == 1, "the total is a fact about what happened"
+    assert pull["ci_rounds_base"] == 1, "the budget refreshes by moving its base"
+
+
+async def test_a_merged_issue_still_polls_its_session_but_acts_on_nothing(orc, clock):
+    """Dropping it from the poll froze its ACU figure at whatever it read before the merge, while
+    the session went on spending."""
+    orchestrator, repo, devin, github = orc
+    session_id = await _with_open_pr(orc)
+    github.add_pull(10, sha="sha1", merged=True)
+    await orchestrator.tick(pr_every=1)
+    assert status_of(orchestrator, 2) is IssueStatus.MERGED
+
+    devin.script(session_id, devin.state("running", "working", acus=19.0))
+    polls_before = len(devin.get_calls)
+    comments_before = len(github.comments)
+    clock.advance(300)
+    await orchestrator.tick()
+
+    assert len(devin.get_calls) > polls_before, "a still-running session is still spending"
+    assert repo.session(session_id)["acus"] == 19.0
+    assert len(github.comments) == comments_before, "a settled issue is not written to again"

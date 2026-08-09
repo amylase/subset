@@ -45,7 +45,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     status            TEXT,
     status_detail     TEXT,
     acus              REAL NOT NULL DEFAULT 0,
+    -- `nudges` only ever increases; `nudge_base` is what it read when a human last handed the
+    -- session back. The budget is the difference. Two columns because the idempotency key for a
+    -- nudge is built from the ordinal: a counter that resets regenerates a key already recorded as
+    -- done, and the nudge is then silently dropped forever — the session sits blocked, the budget
+    -- never advances, and the escalation branch behind it becomes unreachable.
     nudges            INTEGER NOT NULL DEFAULT 0,
+    nudge_base        INTEGER NOT NULL DEFAULT 0,
     ever_blocked      INTEGER NOT NULL DEFAULT 0,  -- sticky: waiting_for_user decays into sleep
     last_message_at   REAL,       -- grace anchor, stamped on every outbound message
     -- Two independent facts. Collapsing them meant a session that opened a pull request and went to
@@ -76,10 +82,18 @@ CREATE TABLE IF NOT EXISTS pull_requests (
     session_id    TEXT,
     url           TEXT,
     opened_at     REAL,
-    ci_settled_at REAL,          -- all checks complete: splits CI wait from human review wait
-    ci_conclusion TEXT,
-    ci_rounds     INTEGER NOT NULL DEFAULT 0,
-    ci_last_sha   TEXT,          -- the commit the last round of feedback was sent for
+    -- Stamped when the checks for `ci_settled_sha` completed, and rewritten only when a *different*
+    -- commit settles. Rewriting it on every poll made it track the present instead of the event:
+    -- the CI slice then absorbed the human review wait, and the headline "the bottleneck is review,
+    -- not the agent" inverted.
+    ci_settled_at  REAL,
+    ci_settled_sha TEXT,
+    ci_conclusion  TEXT,
+    -- Same shape as `nudges`/`nudge_base`: the total is monotonic so `ci_first_pass_rate` cannot be
+    -- flattered by a reset, and the budget is measured from the base.
+    ci_rounds      INTEGER NOT NULL DEFAULT 0,
+    ci_rounds_base INTEGER NOT NULL DEFAULT 0,
+    ci_last_sha    TEXT,         -- the commit the last round of feedback was sent for
     merged_at     REAL,
     closed_at     REAL
 );

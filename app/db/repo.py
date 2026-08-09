@@ -188,24 +188,42 @@ class Repo:
             ).fetchone()
             return int(row["attempts"]) if row else 0
 
-    def flag_for_human(self, number: int, reason: str) -> bool:
-        """Ask for a human. True the first time a given reason applies, so it is said once.
+    def flag_for_human(self, number: int, reason: str) -> float | None:
+        """Ask for a human. Returns *when* this flagging happened, or ``None`` if it is not news.
 
         One flag and one reason is the whole escalation surface. A different reason overwrites the
         first rather than opening a parallel record: an operator needs to know that attention is
         required and what is blocking it *now*.
+
+        What comes back is ``needs_human_at`` — the start of this *episode* of needing attention,
+        not the moment this particular reason applied. The caller keys its comment on it, and that
+        makes both cases come out right: a reason that recurs after a human cleared the flag falls
+        in a new episode and is announced again, while two live conditions alternating inside one
+        unresolved episode are each announced once instead of on every tick. Keying on the reason
+        alone got the first case wrong — the recurrence arrived as a label and nothing else, silence
+        on the issue thread, which is the one place a human is actually watching.
         """
         ts = now()
         with self._conn() as conn:
-            return (
-                conn.execute(
-                    "UPDATE issues SET needs_human_at = COALESCE(needs_human_at, ?),"
-                    " needs_human_reason = ?, updated_at = ?"
-                    " WHERE number = ? AND COALESCE(needs_human_reason, '') != ?",
-                    (ts, reason, ts, number, reason),
-                ).rowcount
-                == 1
+            row = conn.execute(
+                "UPDATE issues SET needs_human_at = COALESCE(needs_human_at, ?),"
+                " needs_human_reason = ?, updated_at = ?"
+                " WHERE number = ? AND COALESCE(needs_human_reason, '') != ?"
+                " RETURNING needs_human_at",
+                (ts, reason, ts, number, reason),
+            ).fetchone()
+            unknown = (
+                row is None
+                and conn.execute("SELECT 1 FROM issues WHERE number = ?", (number,)).fetchone()
+                is None
             )
+        if row is not None:
+            return float(row["needs_human_at"])
+        if unknown:
+            # Not "already flagged" — the issue is not tracked at all, so the escalation has
+            # nowhere to land. Rare, and exactly the case a silent `False` would hide.
+            self.bump("flag_dropped_unknown_issue")
+        return None
 
     def clear_human_flag(self, number: int) -> bool:
         with self._conn() as conn:
@@ -349,11 +367,20 @@ class Repo:
 
         Without this the loop re-enters the exhausted branch on the next poll and re-raises the same
         notification the human just answered — the comment-spam loop, on a second path.
+
+        The counters themselves are never rewound. Only the base they are measured from moves, so
+        the nudge ordinal that forms an idempotency key keeps increasing and the totals the metrics
+        read stay true. Zeroing them did both kinds of damage: a regenerated key made every later
+        nudge a silent no-op, and a reset `ci_rounds` reported a pull request that had failed CI as
+        having passed first time.
         """
         with self._conn() as conn:
-            conn.execute("UPDATE sessions SET nudges = 0 WHERE session_id = ?", (session_id,))
             conn.execute(
-                "UPDATE pull_requests SET ci_rounds = 0, ci_last_sha = NULL WHERE session_id = ?",
+                "UPDATE sessions SET nudge_base = nudges WHERE session_id = ?", (session_id,)
+            )
+            conn.execute(
+                "UPDATE pull_requests SET ci_rounds_base = ci_rounds, ci_last_sha = NULL "
+                "WHERE session_id = ?",
                 (session_id,),
             )
 
@@ -466,8 +493,10 @@ class Repo:
             "merged_at",
             "closed_at",
             "ci_settled_at",
+            "ci_settled_sha",
             "ci_conclusion",
             "ci_rounds",
+            "ci_rounds_base",
             "ci_last_sha",
         }
         unknown = set(fields) - allowed
