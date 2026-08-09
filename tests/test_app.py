@@ -302,7 +302,10 @@ def test_metrics_read_the_columns_the_repo_actually_writes(client):
     assert m.resolution_rate == 1.0
     assert m.acus_total == 6.0
     assert m.cost_per_resolution_usd == 12.0
-    assert m.durations.agent == 100.0
+    # `queued` and `agent` are measured against the session's real `created_at`, which a live Repo
+    # stamps from the wall clock — so they split the 100s rather than each being it.
+    assert m.durations.queued + m.durations.agent == pytest.approx(100.0)
+    assert m.durations.queued < 1.0, "nothing queued here; the cap was never reached"
     assert m.durations.ci == 100.0
     assert m.durations.human_review == 300.0
     assert m.autonomy_rate == 1.0

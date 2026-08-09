@@ -40,7 +40,7 @@ def row(number, status=IssueStatus.MERGED, *, labeled_at=0.0, klass=None, attemp
     }
 
 
-def session(sid: str, acus: float, *, detail="finished", closed=None, turns=None):
+def session(sid: str, acus: float, *, detail="finished", closed=None, turns=None, created=0.0):
     return {
         "session_id": sid,
         "acus": acus,
@@ -48,6 +48,7 @@ def session(sid: str, acus: float, *, detail="finished", closed=None, turns=None
         "status_detail": detail,
         "closed_reason": closed,
         "devin_messages": turns,
+        "created_at": created,
     }
 
 
@@ -88,20 +89,47 @@ def test_cost_per_resolution_includes_acus_from_failed_sessions():
     assert m.cost_per_resolution_usd == 30.0
 
 
-def test_mttr_is_split_three_ways():
+def test_mttr_is_split_four_ways():
     m = make(
         view=[row(1, labeled_at=0.0)],
-        sessions=[session("s1", 4)],
+        sessions=[session("s1", 4, created=0.5 * HOUR)],
         pulls=[pull(10, 1, "s1", opened=HOUR, ci=2 * HOUR, merged=10 * HOUR)],
     )
     d = m.durations
-    assert (d.agent, d.ci, d.human_review, d.total, d.samples) == (
-        HOUR,
+    assert (d.queued, d.agent, d.ci, d.human_review, d.total, d.samples) == (
+        0.5 * HOUR,
+        0.5 * HOUR,
         HOUR,
         8 * HOUR,
         10 * HOUR,
         1,
     )
+
+
+def test_time_held_by_the_concurrency_cap_is_not_charged_to_the_agent():
+    """The first cut of this measured `agent` from the label, so an issue queued behind the cap
+    made the agent look slower than it was — on the real run, by two thirds. Queue time is a knob
+    an operator set, and a leader reading the split has to be able to tell the two apart."""
+    m = make(
+        view=[row(1, labeled_at=0.0)],
+        sessions=[session("s1", 4, created=9 * HOUR)],
+        pulls=[pull(10, 1, "s1", opened=10 * HOUR, ci=11 * HOUR, merged=12 * HOUR)],
+    )
+    assert m.durations.queued == 9 * HOUR
+    assert m.durations.agent == HOUR
+    assert m.durations.total == 12 * HOUR, "the total still runs from the label"
+
+
+def test_a_pull_request_with_no_known_session_contributes_no_agent_sample():
+    """Falling back to the label would quietly reintroduce the queue time."""
+    m = make(
+        view=[row(1, labeled_at=0.0)],
+        sessions=[],
+        pulls=[pull(10, 1, "gone", opened=10 * HOUR, ci=11 * HOUR, merged=12 * HOUR)],
+    )
+    assert m.durations.agent is None
+    assert m.durations.queued is None
+    assert m.durations.ci == HOUR
 
 
 def test_human_review_dominating_is_visible_not_hidden():

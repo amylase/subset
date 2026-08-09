@@ -41,6 +41,7 @@
   .split { display: flex; height: 26px; border-radius: 6px; overflow: hidden; border: 1px solid var(--line); }
   .split div { display: flex; align-items: center; justify-content: center; font-size: 11px;
                color: #fff; white-space: nowrap; min-width: 0; }
+  .seg-queue { background: #64748b; }
   .seg-agent { background: #2563eb; } .seg-ci { background: #7c3aed; } .seg-review { background: #b45309; }
   .legend { display: flex; gap: 18px; margin-top: 10px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
   .legend b { color: var(--ink); font-weight: 600; }
@@ -115,15 +116,18 @@
   <h2>Where the time goes</h2>
   <div class="panel">
     {% set d = m.durations %}
-    {% set a = d.agent or 0 %}{% set c = d.ci or 0 %}{% set r = d.human_review or 0 %}
-    {% set tot = (a + c + r) or 1 %}
+    {% set q = d.queued or 0 %}{% set a = d.agent or 0 %}
+    {% set c = d.ci or 0 %}{% set r = d.human_review or 0 %}
+    {% set tot = (q + a + c + r) or 1 %}
     <div class="split">
+      <div class="seg-queue" style="width: {{ (100 * q / tot) | round(1) }}%">{{ d.queued | dur }}</div>
       <div class="seg-agent" style="width: {{ (100 * a / tot) | round(1) }}%">{{ d.agent | dur }}</div>
       <div class="seg-ci" style="width: {{ (100 * c / tot) | round(1) }}%">{{ d.ci | dur }}</div>
       <div class="seg-review" style="width: {{ (100 * r / tot) | round(1) }}%">{{ d.human_review | dur }}</div>
     </div>
     <div class="legend">
-      <span><i class="dot" style="background:#2563eb"></i>Devin — <b>{{ d.agent | dur }}</b> label to PR</span>
+      <span><i class="dot" style="background:#64748b"></i>Queued — <b>{{ d.queued | dur }}</b> label to session, held by the concurrency cap</span>
+      <span><i class="dot" style="background:#2563eb"></i>Devin — <b>{{ d.agent | dur }}</b> session to PR</span>
       <span><i class="dot" style="background:#7c3aed"></i>CI — <b>{{ d.ci | dur }}</b> PR to checks settled</span>
       <span><i class="dot" style="background:#b45309"></i>Human review — <b>{{ d.human_review | dur }}</b> checks to merge</span>
     </div>

@@ -9,9 +9,10 @@ success, not one success and two failures.
 **Charge failures to the numerator.** Cost per resolution divides *total* ACUs — including those
 burned by sessions that never merged — by the issues actually resolved.
 
-**Split MTTR three ways.** A single duration hides where the time goes. On Superset the split is
-roughly agent minutes, CI tens of minutes, human review hours; the bottleneck is not the agent, and
-that is the finding worth surfacing.
+**Split MTTR four ways.** A single duration hides where the time goes, and the first cut of this
+split hid something too: it measured "agent" from the label, so an issue waiting behind the
+concurrency cap was charged to the agent. Queue time is a knob an operator set. Separating them is
+what makes the remaining number worth acting on.
 
 **Read the same status the dashboard reads.** This module is handed the derived view rather than
 recomputing anything, so the two can no longer disagree — in v1 they did, for the same issue.
@@ -41,7 +42,13 @@ def _percentile(values: list[float], pct: float) -> float | None:
 class Durations:
     """MTTR, decomposed. Seconds; ``None`` means not enough data yet."""
 
-    agent: float | None = None  # labeled -> pull request opened
+    # Four slices, not three. `agent` used to run from the label, which folded in however long the
+    # issue sat behind the concurrency cap — on this run that was most of an hour for the last
+    # issue, and it made the agent look two thirds slower than it was. Queue time is a knob an
+    # operator set, not work the agent did, and conflating the two hides the one number a leader
+    # can actually act on.
+    queued: float | None = None  # labeled -> session created (the concurrency cap)
+    agent: float | None = None  # session created -> pull request opened
     ci: float | None = None  # pull request opened -> checks settled
     human_review: float | None = None  # checks settled -> merged
     total: float | None = None  # labeled -> merged
@@ -159,14 +166,21 @@ def compute(
 
     # --- durations ---------------------------------------------------------
     labeled_at = {row["number"]: row["first_labeled_at"] for row in view}
-    agent, ci, review, total = [], [], [], []
+    started_at = {s["session_id"]: s["created_at"] for s in sessions}
+    queued, agent, ci, review, total = [], [], [], [], []
     for pull in pull_requests:
         # Explicit None checks: these are epoch timestamps and a legitimate 0.0 must not read as
         # missing. A truthiness test here silently drops samples.
         start = labeled_at.get(pull["issue_number"])
+        began = started_at.get(pull["session_id"])
         opened_at, settled, merged_at = pull["opened_at"], pull["ci_settled_at"], pull["merged_at"]
-        if start is not None and opened_at is not None:
-            agent.append(opened_at - start)
+        if start is not None and began is not None:
+            queued.append(began - start)
+        # Measured from when the session actually started. Falling back to the label would
+        # reintroduce the queue time this split exists to separate, so a pull request whose session
+        # is unknown contributes no agent sample at all.
+        if began is not None and opened_at is not None:
+            agent.append(opened_at - began)
         if opened_at is not None and settled is not None:
             ci.append(settled - opened_at)
         if settled is not None and merged_at is not None:
@@ -175,6 +189,7 @@ def compute(
             total.append(merged_at - start)
 
     m.durations = Durations(
+        queued=_mean(queued),
         agent=_mean(agent),
         ci=_mean(ci),
         human_review=_mean(review),
