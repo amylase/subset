@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     max_nudges: int = 2
     max_ci_feedback_rounds: int = 3
 
+    #: How many times a pull request may be handed back to resolve a merge conflict. Low, because
+    #: a conflict that survives two honest attempts is usually a design collision between two
+    #: changes rather than a mechanical merge, and that is a decision for a person.
+    max_conflict_rounds: int = 2
+
     #: How long to leave a session alone after sending it anything. A session needs a moment to act
     #: on a message before its state means anything again; without this the loop re-reads a stale
     #: `waiting_for_user` and escalates a session it has just unblocked.

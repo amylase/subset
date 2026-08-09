@@ -173,6 +173,32 @@ your reasoning rather than silently ignoring it.
 """
 
 
+def merge_conflict_message(*, pr_url: str, base: str) -> str:
+    """Sent when a pull request stops merging cleanly.
+
+    A conflict is the case for handing work back to an agent rather than a script. Resolving it
+    needs both changes understood — a script can only pick a side, and picking a side is how a
+    resolved conflict silently reverts someone else's fix.
+
+    No instruction on *how* to resolve it. Devin has the working tree, the history and the tests;
+    naming the strategy from out here would be guessing at a diff we have not read.
+    """
+    return f"""\
+Your pull request no longer merges cleanly into `{base}` — another change landed first and touches
+the same code.
+
+{pr_url}
+
+Bring the branch up to date with `{base}` and resolve the conflicts. Both changes are wanted, so
+preserve the intent of each rather than taking one side wholesale: read what the other change did
+and why before deciding. Re-run the tests afterwards — a conflict resolved by hand is exactly where
+a passing suite stops being evidence — and push to the same branch.
+
+If the change that landed already covers part of this issue, do not re-apply it. Say so in the pull
+request description instead, and leave only what is still needed.
+"""
+
+
 def human_reply_message(*, author: str, comment: str) -> str:
     quoted = quote_untrusted(comment, label=f"a reply from @{author}")
     return f"""\

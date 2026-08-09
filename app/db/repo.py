@@ -91,6 +91,20 @@ class Repo:
                 (key, kind, now()),
             )
 
+    def count_effects(self, prefix: str) -> int:
+        """How many recorded effects share a key prefix.
+
+        Lets a bounded loop be counted without a column of its own: the keys are already the record
+        of what happened, and one that was never sent was never recorded. `LIKE` wildcards in the
+        prefix are escaped, so a key containing `%` cannot widen the count.
+        """
+        pattern = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM done_effects WHERE key LIKE ? ESCAPE '\\'", (pattern,)
+            ).fetchone()
+            return int(row["n"])
+
     def done_effects(self) -> list[dict[str, Any]]:
         with self._conn() as conn:
             return [dict(r) for r in conn.execute("SELECT * FROM done_effects ORDER BY at")]

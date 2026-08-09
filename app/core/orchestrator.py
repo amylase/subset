@@ -569,6 +569,16 @@ class Orchestrator:
             return
 
         sha = pull["head"]["sha"]
+
+        # `mergeable` is computed asynchronously and is null until GitHub has finished, so this
+        # tests for False rather than falsiness — otherwise every pull request looks conflicted for
+        # the first few seconds of its life.
+        if pull.get("mergeable") is False:
+            await self._feed_merge_conflict(record, pull, sha)
+            # A conflicted branch's CI result describes the pre-conflict tree. Reading it as a
+            # verdict on the code would hand Devin two unrelated problems at once.
+            return
+
         settled, conclusion = await self.github.checks_settled(sha)
         if settled and record["ci_settled_sha"] != sha:
             # Stamped once per commit. After a self-correction round the earlier verdict is stale,
@@ -597,6 +607,68 @@ class Orchestrator:
                     f"{self.settings.pr_stale_hours:.0f}h without merging. Review it, or close it "
                     "and re-apply the label to try again."
                 ),
+            )
+
+    async def _feed_merge_conflict(
+        self, record: dict[str, Any], pull: dict[str, Any], sha: str
+    ) -> None:
+        """Hand a conflicted branch back to the session that wrote it.
+
+        Same shape as CI feedback, and for the same reason: the orchestrator observes a fact on
+        GitHub and returns it to whoever owns it. A conflict in particular is work only an agent can
+        do — resolving one means understanding both changes, and a script that automates it can only
+        pick a side, which is how a resolved conflict quietly reverts someone else's fix.
+
+        Bounded by one message per head sha, so Devin pushing is what earns the next attempt, and by
+        `max_conflict_rounds` overall. The rounds are counted from the recorded effects rather than
+        a column: a message that was never sent was never recorded, so the count is the truth.
+        """
+        number = record["pr_number"]
+        key = f"pr:{number}:conflict:{sha}"
+        if self.repo.is_done(key):
+            self.repo.bump("conflict_feedback_deduped")
+            return
+
+        session = self.repo.session(record["session_id"]) if record["session_id"] else None
+        spent = self.repo.count_effects(f"pr:{number}:conflict:")
+        if session is None or spent >= self.settings.max_conflict_rounds:
+            await self.effects.flag_human(
+                record["issue_number"],
+                reason=Reason.MERGE_CONFLICT,
+                detail=(
+                    f"{record['url']} no longer merges into `{pull.get('base', {}).get('ref')}`"
+                    + (
+                        f" and {spent} attempt(s) to resolve it did not clear it."
+                        if session is not None
+                        else " and no session is on record for it."
+                    )
+                    + " A conflict that survives that is usually two changes disagreeing about the "
+                    "same code, which is a decision for a person."
+                ),
+                session=session,
+            )
+            return
+
+        if await self.effects.message_session(
+            session,
+            reason="merge_conflict",
+            body=prompts.merge_conflict_message(
+                pr_url=record["url"] or "", base=pull.get("base", {}).get("ref") or "master"
+            ),
+            key=key,
+            issue_number=record["issue_number"],
+        ):
+            logger.info("handed the merge conflict on PR #%s back (round %s)", number, spent + 1)
+        elif liveness(session) is Liveness.CLOSED:
+            await self.effects.flag_human(
+                record["issue_number"],
+                reason=Reason.MERGE_CONFLICT,
+                detail=(
+                    f"{record['url']} has a merge conflict and the session that opened it is "
+                    "closed, so it cannot be asked to resolve it. Re-apply the label to start a "
+                    "fresh attempt, or resolve it by hand."
+                ),
+                session=session,
             )
 
     # -- the review-fix loop ------------------------------------------------

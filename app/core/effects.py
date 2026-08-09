@@ -36,6 +36,7 @@ class Reason:
     START_FAILED = "start_failed"
     BUDGET_EXHAUSTED = "budget_exhausted"
     PR_CLOSED_UNMERGED = "pr_closed_unmerged"
+    MERGE_CONFLICT = "merge_conflict"
     PR_STALE = "pr_stale"
     NOT_FIXED = "not_fixed"
     INBOX_ABANDONED = "inbox_abandoned"

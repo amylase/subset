@@ -851,6 +851,80 @@ async def test_a_reply_that_cannot_be_delivered_says_so(orc, clock):
     assert [b for _, b in github.comments if "could not be delivered" in b]
 
 
+# --- merge conflicts ---------------------------------------------------------
+
+
+async def test_a_conflicted_branch_is_handed_back_to_the_session_that_wrote_it(orc, clock):
+    """The clearest case for an agent over a script: resolving a conflict means understanding both
+    changes, and automation that resolves one can only pick a side — which is how a merge quietly
+    reverts someone else's fix."""
+    orchestrator, repo, devin, github = orc
+    session_id = await _with_open_pr(orc)
+    github.add_pull(10, sha="sha1", mergeable=False)
+
+    await orchestrator.tick(pr_every=1)
+
+    sent = [m for sid, m in devin.messages if sid == session_id and "no longer merges" in m]
+    assert len(sent) == 1
+    assert "master" in sent[0]
+
+
+async def test_an_uncomputed_mergeable_flag_is_not_read_as_a_conflict(orc, clock):
+    """GitHub returns null until it has worked it out. Treating that as falsy made every pull
+    request look conflicted for the first seconds of its life."""
+    orchestrator, repo, devin, github = orc
+    await _with_open_pr(orc)
+    github.add_pull(10, sha="sha1", mergeable=None)
+    github.checks["sha1"] = (True, "success")
+
+    await orchestrator.tick(pr_every=1)
+
+    assert [m for _, m in devin.messages if "no longer merges" in m] == []
+    assert repo.pull_request(10)["ci_settled_at"] is not None, "CI was still read"
+
+
+async def test_one_conflict_message_per_commit(orc, clock):
+    """Devin pushing is what earns the next attempt; polling is not."""
+    orchestrator, repo, devin, github = orc
+    await _with_open_pr(orc)
+    github.add_pull(10, sha="sha1", mergeable=False)
+
+    for _ in range(3):
+        clock.advance(200)
+        await orchestrator.tick(pr_every=1)
+
+    assert len([m for _, m in devin.messages if "no longer merges" in m]) == 1
+    assert repo.counters()["conflict_feedback_deduped"] == 2
+
+
+async def test_a_conflict_that_survives_the_budget_reaches_a_human(orc, clock):
+    orchestrator, repo, devin, github = orc
+    await _with_open_pr(orc)
+
+    for index, sha in enumerate(("sha2", "sha3", "sha4")):
+        github.add_pull(10, sha=sha, mergeable=False)
+        clock.advance(200)
+        await orchestrator.tick(pr_every=1)
+        if index < 2:
+            assert repo.issue(2)["needs_human_reason"] is None, "still within the budget"
+
+    assert len([m for _, m in devin.messages if "no longer merges" in m]) == 2
+    assert repo.issue(2)["needs_human_reason"] == "merge_conflict"
+    assert [b for _, b in github.comments if "merge_conflict" in b]
+
+
+async def test_a_conflict_on_a_closed_session_reaches_a_human(orc, clock):
+    orchestrator, repo, devin, github = orc
+    session_id = await _with_open_pr(orc)
+    repo.close_session(session_id, "error")
+    github.add_pull(10, sha="sha1", mergeable=False)
+
+    await orchestrator.tick(pr_every=1)
+
+    assert repo.issue(2)["needs_human_reason"] == "merge_conflict"
+    assert devin.messages == []
+
+
 # --- the reviewer arm of the review-fix loop ---------------------------------
 
 

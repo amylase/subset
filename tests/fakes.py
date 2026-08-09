@@ -137,12 +137,25 @@ class FakeGitHub:
             "labels": [{"name": name} for name in labels],
         }
 
-    def add_pull(self, number: int, *, sha: str = "sha1", merged: bool = False, state="open"):
+    def add_pull(
+        self,
+        number: int,
+        *,
+        sha: str = "sha1",
+        merged: bool = False,
+        state="open",
+        mergeable: bool | None = True,
+        base: str = "master",
+    ):
         self.pulls[number] = {
             "number": number,
             "state": "closed" if merged or state == "closed" else "open",
             "merged_at": "2026-01-01T00:00:00Z" if merged else None,
             "head": {"sha": sha},
+            # GitHub computes this asynchronously and returns null until it is ready, which the
+            # orchestrator has to tell apart from a genuine conflict.
+            "mergeable": mergeable,
+            "base": {"ref": base},
         }
 
     # -- the client interface ----------------------------------------------
