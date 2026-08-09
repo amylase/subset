@@ -24,6 +24,9 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", "admin-secret")
     monkeypatch.setenv("DB_PATH", str(tmp_path / "app.db"))
     monkeypatch.setenv("SESSION_POLL_INTERVAL", "3600")
+    # The loop ticks once immediately on startup. Push the resync and analytics passes far out so
+    # this test never reaches the network with placeholder credentials.
+    monkeypatch.setenv("RESYNC_INTERVAL", "864000")
 
     from app.config import get_settings
 
@@ -68,6 +71,7 @@ def test_the_admin_api_is_absent_unless_configured(tmp_path, monkeypatch):
         "WEBHOOK_SECRET": "s",
         "DB_PATH": str(tmp_path / "b.db"),
         "SESSION_POLL_INTERVAL": "3600",
+        "RESYNC_INTERVAL": "864000",
     }.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("ADMIN_TOKEN", raising=False)

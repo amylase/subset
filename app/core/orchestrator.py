@@ -47,7 +47,7 @@ import logging
 import re
 from typing import Any
 
-from app.clients.devin import DevinClient, last_devin_message
+from app.clients.devin import DevinClient, collection_items, last_devin_message
 from app.clients.github import GitHubClient
 from app.clients.http import ApiError
 from app.config import Settings
@@ -151,6 +151,7 @@ class Orchestrator:
             # disabled resync exactly when it was asked for most often (the admin endpoint).
             if self._tick % resync_every == 0:
                 await self.resync()
+                await self.refresh_insights()
 
     # -- pass 1: act on recorded intent ------------------------------------
 
@@ -743,6 +744,51 @@ class Orchestrator:
                 await self._register_issue(issue["number"])
             except Exception:
                 logger.exception("resync could not register #%s", issue["number"])
+
+    # -- analytics ----------------------------------------------------------
+
+    async def refresh_insights(self) -> None:
+        """Reconcile against Devin's Analytics endpoint.
+
+        Two things come from here that a per-session read does not give: the message counts (how
+        many turns a fix actually took) and Devin's own size classification.
+
+        The tag filter is sent, but the result is **not** trusted to have applied it. The endpoint
+        accepts unknown query parameters without complaint, so a wrong or renamed filter would
+        return the whole organization's sessions rather than an error — other people's work would
+        quietly land in these metrics. Rows are therefore matched against session ids this
+        orchestrator created; `apply_insight` drops anything else. Tags remain what identifies the
+        sessions in the Devin dashboard, which is what a reviewer cross-checks.
+        """
+        try:
+            response = await self.devin.insights(tags=[ORCHESTRATOR_TAG], first=200)
+        except Exception:
+            logger.exception("insights refresh failed")
+            self.repo.bump("insights_errors")
+            return
+
+        applied = foreign = 0
+        for row in collection_items(response):
+            session_id = row.get("session_id")
+            if not session_id:
+                continue
+            if self.repo.apply_insight(
+                session_id,
+                acus=float(row.get("acus_consumed") or 0),
+                devin_messages=row.get("num_devin_messages"),
+                user_messages=row.get("num_user_messages"),
+                session_size=row.get("session_size"),
+            ):
+                applied += 1
+            else:
+                foreign += 1
+
+        self.repo.bump("insights_applied", applied)
+        if foreign:
+            # Worth counting rather than ignoring: a non-zero value means the tag filter is not
+            # doing what the request asked for.
+            self.repo.bump("insights_rows_not_ours", foreign)
+        logger.info("insights refreshed: %s applied, %s not ours", applied, foreign)
 
     # -- derived issue state for the dashboard ------------------------------
 

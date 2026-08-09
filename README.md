@@ -121,7 +121,16 @@ The dashboard is at `/`, refreshes every 15 seconds, and answers one question: *
 | Merge rate | Merged ÷ opened pull requests. |
 
 **Below the fold** — session outcome breakdown by `status_detail`, intervention counts by kind, CI
-first-pass rate, webhook delivery and dedup counters, retry counts.
+first-pass rate, Devin turns per resolution, webhook delivery and dedup counters, retry counts.
+
+Cost and effort figures are reconciled against Devin's Analytics endpoint
+(`GET /v3/organizations/{org}/sessions/insights`), which also supplies the message counts and size
+classification a per-session read does not carry. The tag filter is sent but **not trusted to have
+been applied**: that endpoint accepts unknown query parameters without complaint, so a renamed or
+mistyped filter would return the whole organization instead of an error, and other people's sessions
+would quietly enter these numbers. Rows are matched against session ids this orchestrator created,
+and anything else is counted and discarded. Tags remain what identifies the sessions in the Devin
+dashboard — which is what a reviewer cross-checks — but they are not what the arithmetic trusts.
 
 Money figures rest on an ACU price and an assumed manual effort per issue. Both are printed on the
 page as assumptions, along with the sample size, because a rate over five issues shown without `n`
@@ -215,20 +224,35 @@ pip install -e ".[dev]"
 pytest
 ```
 
-88 tests covering the orchestrator itself, with no network and no credentials required:
+168 tests covering the orchestrator itself, with no network and no credentials required:
 
+- **The loop, end to end** — label → session → pull request → completion comment → merge, driven
+  against recording doubles and a real database. Also: the concurrency cap actually holding back a
+  third session, concurrent ticks not double-spending, a failure after a billable call never
+  re-spending, bounded nudges, escalation written exactly once, a human reply resuming instead of
+  re-escalating, one CI feedback round per commit, resync recovering an undelivered event.
 - **Signature verification** — valid, tampered, missing header, empty header, legacy SHA-1, wrong
-  secret, and re-serialised JSON (the intermittent-failure bug).
+  secret, and the router verifying the exact bytes received (written as a literal non-canonical
+  body, because a fixture built with `json.dumps` cannot express that bug).
 - **Receiver behaviour** — redelivery with the same GUID creates one session, not two; non-trigger
   labels and non-`labeled` actions do nothing; another repository is ignored even when correctly
-  signed.
+  signed; only trusted `author_association` values can put text in front of the agent.
+- **Clients** — retry, exponential backoff, `Retry-After`, 4xx raised rather than swallowed;
+  check-run pagination and every failing conclusion; the create-session payload, including the tags;
+  the message-list shape.
 - **State interpretation** — a finished task still reports `running`; a suspended session is asleep,
   not failed; an unknown suspension degrades to sleep rather than inflating the failure rate.
 - **Policy** — every cap pinned at its boundary.
 - **Metrics** — resolution rate denominated per issue; cost per resolution including failed
-  sessions; the three-way MTTR split; empty state reporting `None` rather than a misleading 0%.
+  sessions; the three-way MTTR split; empty state reporting `None` rather than a misleading 0%; and
+  one seam test that runs the metric functions over rows a real `Repo` wrote, so a schema rename
+  cannot break the dashboard while every unit test stays green.
 - **Persistence** — re-labelling does not reset the MTTR clock; the blocked state is latched before
-  it decays into sleep.
+  it decays into sleep; recorded spend is never lowered by a later poll.
+
+One invariant is deliberately **not** claimed as tested: `hmac.compare_digest` cannot be pinned by
+assertion, because replacing it with `==` changes only timing. It is enforced by reading the code,
+not by a test that would give false comfort.
 
 Remediation code changes are tested separately, in Superset's own CI on each pull request.
 
@@ -282,9 +306,14 @@ Stated plainly, because a system whose reporting hides its own gaps is not worth
   would need a real queue and leader election.
 - **Polling, not push.** No Devin push callbacks were found in the v3 documentation, so session
   state is pulled on a 10-second cadence, as the official examples do.
-- **Cost figures come from `insights.acus_consumed`.** The enterprise consumption endpoints
-  (`/v3/enterprise/consumption/*`) return 403 for an org-scoped service user, so per-day billing
-  breakdowns are unavailable here.
+- **No per-day billing breakdown.** The enterprise consumption endpoints
+  (`/v3/enterprise/consumption/*`) return 403 for an org-scoped service user (verified), so cost is
+  built from `acus_consumed` — read per session and reconciled against the Analytics endpoint.
+- **The `repos` value format is unverified.** Devin's documentation gives `repos` no description and
+  no example anywhere; the CLI consistently uses `owner/repo`, which is what is sent here. The first
+  real session settles it by showing which repository was attached.
+- **Server-side tag filtering on Analytics is unverified**, which is why it is not relied on. See
+  the note in Observability.
 - **Money and time-saved numbers rest on stated assumptions**, printed on the dashboard rather than
   buried.
 - **Small sample.** Rates are computed over a handful of issues and are indicative, not statistical.

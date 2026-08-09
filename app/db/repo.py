@@ -53,6 +53,9 @@ class Repo:
         ("sessions", "reported_at", "REAL"),
         ("sessions", "last_message_at", "REAL"),
         ("sessions", "closed_at", "REAL"),
+        ("sessions", "devin_messages", "INTEGER"),
+        ("sessions", "user_messages", "INTEGER"),
+        ("sessions", "session_size", "TEXT"),
         ("pull_requests", "ci_feedback_sha", "TEXT"),
         ("queue", "attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("queue", "last_error", "TEXT"),
@@ -303,6 +306,34 @@ class Repo:
         with self._conn() as conn:
             conn.execute(
                 "UPDATE sessions SET last_message_at = ? WHERE session_id = ?", (now(), session_id)
+            )
+
+    def apply_insight(
+        self,
+        session_id: str,
+        *,
+        acus: float,
+        devin_messages: int | None,
+        user_messages: int | None,
+        session_size: str | None,
+    ) -> bool:
+        """Merge a row from the Analytics endpoint into a session we already know about.
+
+        ACUs go into the same ``acus`` column under ``MAX``, so the analytics figure and the
+        per-session read reconcile to the higher of the two rather than fighting each other. The
+        message counts and size classification exist only here.
+
+        Returns ``False`` for a session id we did not create — the org may contain sessions from
+        other sources, and only our own belong in these metrics.
+        """
+        with self._conn() as conn:
+            return (
+                conn.execute(
+                    "UPDATE sessions SET acus = MAX(acus, ?), devin_messages = ?,"
+                    " user_messages = ?, session_size = ? WHERE session_id = ?",
+                    (acus, devin_messages, user_messages, session_size, session_id),
+                ).rowcount
+                == 1
             )
 
     def close_session(self, session_id: str) -> bool:

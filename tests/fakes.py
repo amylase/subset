@@ -21,6 +21,10 @@ class FakeDevin:
         self.states: dict[str, list[dict[str, Any]]] = {}
         self.get_calls: list[str] = []
         self.create_error: Exception | None = None
+        #: Rows the analytics endpoint returns. Includes foreign sessions in some tests, because
+        #: the endpoint ignores unknown filters rather than rejecting them.
+        self.insight_rows: list[dict[str, Any]] = []
+        self.insight_calls: list[Any] = []
         self._next = 1
 
     # -- scripting ----------------------------------------------------------
@@ -85,6 +89,10 @@ class FakeDevin:
 
     async def list_messages(self, session_id: str, *, first: int = 50) -> Any:
         return self.message_log
+
+    async def insights(self, *, tags: list[str] | None = None, first: int = 100) -> Any:
+        self.insight_calls.append(tags)
+        return {"items": self.insight_rows}
 
 
 class FakeGitHub:

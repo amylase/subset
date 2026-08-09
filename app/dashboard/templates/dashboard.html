@@ -165,6 +165,7 @@
         {% for k, v in m.interventions_by_kind.items() %}<div><span>intervention · {{ k }}</span><span>{{ v }}</span></div>{% endfor %}
         {% for k, v in m.counters.items() %}<div><span>{{ k | replace("_", " ") }}</span><span>{{ "%g"|format(v) }}</span></div>{% endfor %}
         <div><span>CI first-pass rate</span><span>{{ m.ci_first_pass_rate | pct }}</span></div>
+        <div><span>Devin turns per resolution</span><span>{% if m.devin_turns_per_resolution is not none %}{{ "%.0f"|format(m.devin_turns_per_resolution) }}{% else %}—{% endif %}</span></div>
         <div><span>interventions per resolution</span><span>{% if m.interventions_per_resolution is not none %}{{ "%.1f"|format(m.interventions_per_resolution) }}{% else %}—{% endif %}</span></div>
       </div>
     </details>

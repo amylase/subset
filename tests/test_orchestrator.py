@@ -520,3 +520,61 @@ async def test_a_merged_issue_stays_merged_after_a_late_session_error(orc):
     devin.script(session_id, devin.state("error", None))
     await orchestrator.tick()
     assert repo.issue(2)["state"] == IssueState.MERGED
+
+
+# --- analytics --------------------------------------------------------------
+
+
+async def test_insights_only_apply_to_sessions_we_created(orc):
+    """The endpoint accepts unknown query parameters without complaint.
+
+    A wrong or renamed tag filter would therefore return the whole organization rather than an
+    error, and other people's sessions would land in these metrics. Rows are matched against
+    session ids this orchestrator created.
+    """
+    orchestrator, repo, devin, _ = orc
+    await label(orc, 2)
+    await orchestrator.tick()
+    ours = devin.created[0]["session_id"]
+    devin.insight_rows = [
+        {
+            "session_id": ours,
+            "acus_consumed": 9.0,
+            "num_devin_messages": 14,
+            "num_user_messages": 2,
+            "session_size": "m",
+        },
+        {"session_id": "someone-elses", "acus_consumed": 500.0, "num_devin_messages": 99},
+    ]
+
+    await orchestrator.refresh_insights()
+
+    assert repo.session(ours)["devin_messages"] == 14
+    assert repo.session(ours)["session_size"] == "m"
+    assert repo.total_acus() == 9.0, "a foreign session must not enter the cost figures"
+    assert repo.counters()["insights_rows_not_ours"] == 1
+    assert devin.insight_calls == [[ORCHESTRATOR_TAG]]
+
+
+async def test_insights_never_lower_recorded_spend(orc):
+    orchestrator, repo, devin, _ = orc
+    await label(orc, 2)
+    await orchestrator.tick()
+    session_id = devin.created[0]["session_id"]
+    devin.script(session_id, devin.state(acus=11.0))
+    await orchestrator.tick()
+
+    devin.insight_rows = [{"session_id": session_id, "acus_consumed": 3.0}]
+    await orchestrator.refresh_insights()
+    assert repo.total_acus() == 11.0
+
+
+async def test_a_failing_insights_refresh_is_not_fatal(orc):
+    orchestrator, repo, devin, _ = orc
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("analytics down")
+
+    devin.insights = broken  # type: ignore[assignment]
+    await orchestrator.refresh_insights()
+    assert repo.counters()["insights_errors"] == 1

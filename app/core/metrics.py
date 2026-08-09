@@ -69,6 +69,10 @@ class Metrics:
     interventions_by_kind: dict[str, int] = field(default_factory=dict)
     interventions_per_resolution: float | None = None
     ci_first_pass_rate: float | None = None
+    #: Devin turns per resolution, from the Analytics endpoint. A rising figure means fixes are
+    #: taking more back-and-forth, which usually points at issue bodies that need better acceptance
+    #: criteria rather than at the agent.
+    devin_turns_per_resolution: float | None = None
     counters: dict[str, float] = field(default_factory=dict)
 
     # honesty
@@ -177,6 +181,11 @@ def compute(
         total_p90=_percentile(total, 90),
         samples=len(total),
     )
+
+    # --- effort, from the Analytics endpoint -------------------------------
+    turns = [s["devin_messages"] for s in sessions if s.get("devin_messages")]
+    if turns and m.issues_resolved:
+        m.devin_turns_per_resolution = sum(turns) / m.issues_resolved
 
     # --- CI first-pass rate ------------------------------------------------
     # Pull requests whose checks went green without the review-fix loop being invoked.

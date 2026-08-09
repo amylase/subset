@@ -53,6 +53,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- escalate a session that has not yet had a chance to act on the last thing it was sent.
     last_message_at   REAL,
     structured_output TEXT,
+    -- Filled from the Analytics (insights) endpoint. ACUs are reconciled into `acus` above rather
+    -- than kept separately; these are the figures that endpoint adds on top of a session read.
+    devin_messages    INTEGER,
+    user_messages     INTEGER,
+    session_size      TEXT,     -- Devin's own xs/s/m/l/xl classification
     FOREIGN KEY (issue_number) REFERENCES issues (number)
 );
 
