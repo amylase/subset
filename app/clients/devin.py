@@ -141,8 +141,13 @@ class DevinClient:
     async def list_playbooks(self) -> Any:
         return await self._call("GET", "/playbooks")
 
-    async def create_playbook(self, name: str, body: str) -> Any:
-        return await self._call("POST", "/playbooks", json={"name": name, "body": body})
+    async def create_playbook(self, title: str, body: str) -> Any:
+        """Create a playbook.
+
+        The field is ``title``, not ``name`` — the API rejects ``name`` with a 422. Confirmed
+        against the live endpoint rather than inferred from the docs.
+        """
+        return await self._call("POST", "/playbooks", json={"title": title, "body": body})
 
     async def list_schedules(self) -> Any:
         return await self._call("GET", "/schedules")
@@ -158,6 +163,23 @@ class DevinClient:
         if title:
             payload["title"] = title
         return await self._call("POST", "/schedules", json=payload)
+
+
+def collection_items(response: Any) -> list[dict[str, Any]]:
+    """Rows out of a v3 list response.
+
+    List endpoints return ``{"items": [...], "end_cursor": ..., "has_next_page": ...}``. Tolerant of
+    a bare list too, so a shape change degrades to empty rather than raising.
+    """
+    if isinstance(response, dict):
+        for key in ("items", "playbooks", "schedules", "sessions"):
+            value = response.get(key)
+            if isinstance(value, list):
+                return [v for v in value if isinstance(v, dict)]
+        return []
+    if isinstance(response, list):
+        return [v for v in response if isinstance(v, dict)]
+    return []
 
 
 def last_devin_message(messages: Any) -> str:

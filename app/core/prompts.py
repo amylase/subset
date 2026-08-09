@@ -18,7 +18,7 @@ acceptance criteria, record the decision and your reasoning under an "Assumption
 pull request description, and continue. Stop and ask only when the decision genuinely depends on \
 product requirements that cannot be inferred from the codebase."""
 
-PLAYBOOK_NAME = "Superset autonomous remediation"
+PLAYBOOK_TITLE = "Superset autonomous remediation"
 
 PLAYBOOK_BODY = f"""\
 # Superset autonomous remediation
