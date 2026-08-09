@@ -115,7 +115,7 @@ The dashboard is at `/`, refreshes every 15 seconds, and answers one question: *
 | Metric | Why this one |
 | --- | --- |
 | Resolution rate | Issues closed by a merged PR, denominated **per issue**. An issue that needed three sessions and got fixed is one success, not one in three. |
-| Time to merge, split three ways | Devin / CI / human review, separately. A single number hides where the time goes — and the split shows the bottleneck is not the agent. |
+| Time to merge, split four ways | Queued / Devin / CI / human review, separately. A single number hides where the time goes. The first cut of this split hid something too: it measured Devin's slice from the label, so an issue waiting behind the concurrency cap was charged to the agent — 35 minutes of queue on this run, reported as agent time. Queue time is a knob an operator set, and separating the two is what makes the rest worth acting on. |
 | Cost per resolution | Total ACUs **including sessions that never merged**, over issues actually resolved. Success-only cost accounting is a vanity metric. |
 | Autonomy rate | Completed with zero human intervention. Automatic nudges count as intervention. |
 | Merge rate | Merged ÷ opened pull requests. |
@@ -261,7 +261,9 @@ pytest
   not failed; an unknown suspension degrades to sleep rather than inflating the failure rate.
 - **Policy** — every cap pinned at its boundary.
 - **Metrics** — resolution rate denominated per issue; cost per resolution including failed
-  sessions; the three-way MTTR split; empty state reporting `None` rather than a misleading 0%; and
+  sessions; the four-way MTTR split, including that a pull request whose session is unknown
+  contributes no agent sample rather than falling back to the label and smuggling queue time back
+  in; empty state reporting `None` rather than a misleading 0%; and
   one seam test that runs the metric functions over rows a real `Repo` wrote, so a schema rename
   cannot break the dashboard while every unit test stays green.
 - **Persistence** — re-labelling does not reset the MTTR clock; the blocked state is latched before
