@@ -226,7 +226,7 @@ async def test_the_v3_base_is_used():
         devin_api_key="k",
         devin_org_id="org-9",
         github_token="g",
-        webhook_secret="s",
+        webhook_secret="0123456789abcdef0123",
     )
     assert settings.org_base == "https://api.devin.ai/v3/organizations/org-9"
 

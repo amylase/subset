@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,7 +19,11 @@ class Settings(BaseSettings):
     devin_api_key: str
     devin_org_id: str
     github_token: str
-    webhook_secret: str
+
+    #: An empty secret still produces a "valid" HMAC, so a misconfigured deployment would appear to
+    #: verify signatures while accepting anything — including a forged `author_association` that
+    #: defeats the whole trust model. Fail at startup instead.
+    webhook_secret: str = Field(min_length=16)
 
     # --- targets -----------------------------------------------------------
     devin_api_base: str = "https://api.devin.ai/v3"
@@ -32,6 +37,10 @@ class Settings(BaseSettings):
 
     trigger_label: str = "devin-fix"
     escalation_label: str = "needs-human"
+
+    #: The GitHub login this service writes as. Resolved at startup via `GET /user` when unset;
+    #: setting it explicitly makes the identity check deterministic and survives an API hiccup.
+    self_login: str | None = None
 
     # --- storage -----------------------------------------------------------
     db_path: str = "data/orchestrator.db"

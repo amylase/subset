@@ -1,26 +1,28 @@
 """Metric computation.
 
 Pure functions over rows already loaded from the database, so the arithmetic is testable without
-touching SQLite or the network. The design rules, and why they matter, are set out in
-``design/metrics.md``; the three that shape this module:
+SQLite or a network. Design rules are set out in ``design/metrics.md``; four shape this module.
 
 **Denominate by issue, not by session.** An issue that needed three sessions and got fixed is one
-success, not one success and two failures. Session-level numbers exist, but they live in the
-reliability tier where they describe machinery rather than outcomes.
+success, not one success and two failures.
 
 **Charge failures to the numerator.** Cost per resolution divides *total* ACUs — including those
-burned by sessions that never merged — by the number of issues actually resolved. Dividing only
-successful sessions' ACUs by successful outcomes produces a flattering number that means nothing.
+burned by sessions that never merged — by the issues actually resolved.
 
-**Split MTTR three ways.** A single duration hides where time goes. Measured on Superset the split
-is roughly agent minutes, CI tens of minutes, human review hours — which says the bottleneck is not
-the agent, and that is the finding worth surfacing.
+**Split MTTR three ways.** A single duration hides where the time goes. On Superset the split is
+roughly agent minutes, CI tens of minutes, human review hours; the bottleneck is not the agent, and
+that is the finding worth surfacing.
+
+**Read the same status the dashboard reads.** This module is handed the derived view rather than
+recomputing anything, so the two can no longer disagree — in v1 they did, for the same issue.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+
+from app.core.state import IssueStatus
 
 
 def _mean(values: list[float]) -> float | None:
@@ -37,12 +39,12 @@ def _percentile(values: list[float], pct: float) -> float | None:
 
 @dataclass
 class Durations:
-    """MTTR, decomposed. Values are seconds; ``None`` means not enough data yet."""
+    """MTTR, decomposed. Seconds; ``None`` means not enough data yet."""
 
-    agent: float | None = None  # issue labeled -> pull request opened
+    agent: float | None = None  # labeled -> pull request opened
     ci: float | None = None  # pull request opened -> checks settled
     human_review: float | None = None  # checks settled -> merged
-    total: float | None = None  # issue labeled -> merged
+    total: float | None = None  # labeled -> merged
     total_p90: float | None = None
     samples: int = 0
 
@@ -63,28 +65,29 @@ class Metrics:
     engineer_hours_saved: float | None = None
 
     # tier 2 -- operational
-    by_state: dict[str, int] = field(default_factory=dict)
+    by_status: dict[str, int] = field(default_factory=dict)
     by_class: dict[str, int] = field(default_factory=dict)
     session_outcomes: dict[str, int] = field(default_factory=dict)
     interventions_by_kind: dict[str, int] = field(default_factory=dict)
     interventions_per_resolution: float | None = None
     ci_first_pass_rate: float | None = None
-    #: Devin turns per resolution, from the Analytics endpoint. A rising figure means fixes are
-    #: taking more back-and-forth, which usually points at issue bodies that need better acceptance
-    #: criteria rather than at the agent.
     devin_turns_per_resolution: float | None = None
-    counters: dict[str, float] = field(default_factory=dict)
+    attempts_per_issue: float | None = None
 
     # honesty
+    open_notifications: list[dict[str, Any]] = field(default_factory=list)
+    notifications_by_reason: dict[str, int] = field(default_factory=dict)
+    counters: dict[str, float] = field(default_factory=dict)
     assumptions: list[str] = field(default_factory=list)
 
 
 def compute(
     *,
-    issues: list[dict[str, Any]],
+    view: list[dict[str, Any]],
     sessions: list[dict[str, Any]],
     pull_requests: list[dict[str, Any]],
     interventions: list[dict[str, Any]],
+    notifications: list[dict[str, Any]],
     counters: dict[str, float],
     acu_unit_cost_usd: float,
     manual_effort_hours_per_issue: float,
@@ -92,57 +95,52 @@ def compute(
 ) -> Metrics:
     m = Metrics()
     m.counters = counters
+    m.issues_total = len(view)
 
-    m.issues_total = len(issues)
-    # One pull request per issue, preferring a merged one. Devin can open more than one pull
-    # request for an issue; keeping simply the last row reported the issue unresolved even when an
-    # earlier pull request had merged, which silently zeroed the headline number.
-    pr_by_issue: dict[int, dict[str, Any]] = {}
-    for p in pull_requests:
-        key = p["issue_number"]
-        if key is None:
-            continue
-        current = pr_by_issue.get(key)
-        if current is None or (p["merged_at"] and not current["merged_at"]):
-            pr_by_issue[key] = p
-
-    resolved = [i for i in issues if (pr_by_issue.get(i["number"]) or {}).get("merged_at")]
+    resolved = [row for row in view if row["status"] == IssueStatus.MERGED]
     m.issues_resolved = len(resolved)
     if m.issues_total:
         m.resolution_rate = m.issues_resolved / m.issues_total
 
-    # Merge rate is session-facing (PRs opened vs merged); resolution rate is the leadership number.
+    # Merge rate is pull-request facing; resolution rate is the leadership number.
     opened = [p for p in pull_requests if p["opened_at"]]
     merged = [p for p in opened if p["merged_at"]]
     if opened:
         m.merge_rate = len(merged) / len(opened)
 
-    # --- state and class breakdowns ---------------------------------------
-    for issue in issues:
-        state = issue["state"]
-        m.by_state[state] = m.by_state.get(state, 0) + 1
-        klass = issue["klass"] or "unclassified"
+    for row in view:
+        key = str(row["status"])
+        m.by_status[key] = m.by_status.get(key, 0) + 1
+        klass = row["klass"] or "unclassified"
         m.by_class[klass] = m.by_class.get(klass, 0) + 1
 
     for session in sessions:
-        key = session["status_detail"] or session["status"] or "unknown"
+        key = (
+            session["closed_reason"] or session["status_detail"] or session["status"] or "starting"
+        )
         m.session_outcomes[key] = m.session_outcomes.get(key, 0) + 1
 
     for item in interventions:
         m.interventions_by_kind[item["kind"]] = m.interventions_by_kind.get(item["kind"], 0) + 1
 
+    for note in notifications:
+        reason = note["reason_class"]
+        m.notifications_by_reason[reason] = m.notifications_by_reason.get(reason, 0) + 1
+    m.open_notifications = [n for n in notifications if n["resolved_at"] is None]
+
     # --- autonomy ----------------------------------------------------------
-    # An issue counts as autonomous when no intervention of any kind was recorded against it.
-    # Nudges count: an automatic nudge is still the system compensating for a stall.
-    touched = {i["issue_number"] for i in interventions if i["issue_number"] is not None}
     # Denominated on the observed outcome — issues that produced a pull request — like every other
-    # rate here. Reading the stored issue state instead made this the one metric with a different
-    # vocabulary, and it returned None whenever that column disagreed with what GitHub showed.
-    delivered = [i for i in issues if i["number"] in pr_by_issue]
+    # rate here. Automatic nudges count as intervention: the system compensating for a stall is not
+    # the same as not needing to.
+    touched = {i["issue_number"] for i in interventions if i["issue_number"] is not None}
+    pr_issues = {p["issue_number"] for p in opened if p["issue_number"] is not None}
+    delivered = [row for row in view if row["number"] in pr_issues]
     if delivered:
-        m.autonomy_rate = sum(1 for i in delivered if i["number"] not in touched) / len(delivered)
+        m.autonomy_rate = sum(1 for r in delivered if r["number"] not in touched) / len(delivered)
     if m.issues_resolved:
         m.interventions_per_resolution = len(interventions) / m.issues_resolved
+    if view:
+        m.attempts_per_issue = sum(row["attempts"] for row in view) / len(view)
 
     # --- cost --------------------------------------------------------------
     m.acus_total = sum(float(s["acus"] or 0) for s in sessions)
@@ -152,22 +150,21 @@ def compute(
     )
     m.cost_total_usd = m.acus_total * acu_unit_cost_usd
     if m.issues_resolved:
-        # Total ACUs, including failures, over issues actually resolved.
         m.cost_per_resolution_usd = m.cost_total_usd / m.issues_resolved
         m.engineer_hours_saved = m.issues_resolved * manual_effort_hours_per_issue
 
     # --- durations ---------------------------------------------------------
-    labeled_at = {i["number"]: i["labeled_at"] for i in issues}
+    labeled_at = {row["number"]: row["first_labeled_at"] for row in view}
     agent, ci, review, total = [], [], [], []
     for pull in pull_requests:
-        # Explicit None checks throughout: these are epoch timestamps, and a legitimate 0.0 must not
-        # be read as "missing". A truthiness test here silently drops samples.
+        # Explicit None checks: these are epoch timestamps and a legitimate 0.0 must not read as
+        # missing. A truthiness test here silently drops samples.
         start = labeled_at.get(pull["issue_number"])
-        opened, settled, merged_at = pull["opened_at"], pull["ci_settled_at"], pull["merged_at"]
-        if start is not None and opened is not None:
-            agent.append(opened - start)
-        if opened is not None and settled is not None:
-            ci.append(settled - opened)
+        opened_at, settled, merged_at = pull["opened_at"], pull["ci_settled_at"], pull["merged_at"]
+        if start is not None and opened_at is not None:
+            agent.append(opened_at - start)
+        if opened_at is not None and settled is not None:
+            ci.append(settled - opened_at)
         if settled is not None and merged_at is not None:
             review.append(merged_at - settled)
         if start is not None and merged_at is not None:
@@ -182,24 +179,22 @@ def compute(
         samples=len(total),
     )
 
-    # --- effort, from the Analytics endpoint -------------------------------
+    # --- effort and CI -----------------------------------------------------
     turns = [s["devin_messages"] for s in sessions if s.get("devin_messages")]
     if turns and m.issues_resolved:
         m.devin_turns_per_resolution = sum(turns) / m.issues_resolved
 
-    # --- CI first-pass rate ------------------------------------------------
-    # Pull requests whose checks went green without the review-fix loop being invoked.
-    settled = [p for p in pull_requests if p["ci_settled_at"]]
-    if settled:
-        m.ci_first_pass_rate = sum(1 for p in settled if (p["ci_attempts"] or 0) == 0) / len(
-            settled
+    settled_prs = [p for p in pull_requests if p["ci_settled_at"]]
+    if settled_prs:
+        m.ci_first_pass_rate = sum(1 for p in settled_prs if (p["ci_rounds"] or 0) == 0) / len(
+            settled_prs
         )
 
-    # --- assumptions, shown on screen rather than buried -------------------
+    # --- assumptions, shown rather than buried -----------------------------
     m.assumptions = [
         f"ACU priced at ${acu_unit_cost_usd:.2f}; actual billing depends on the contract.",
-        f"Manual effort assumed at {manual_effort_hours_per_issue:.1f}h per issue "
-        f"at ${engineer_hourly_usd:.0f}/h — an estimate, not a measurement.",
+        f"Manual effort assumed at {manual_effort_hours_per_issue:.1f}h per issue at "
+        f"${engineer_hourly_usd:.0f}/h — an estimate, not a measurement.",
         f"n = {m.issues_total} issues; rates over a sample this small are indicative only.",
     ]
     return m

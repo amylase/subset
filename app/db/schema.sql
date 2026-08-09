@@ -1,33 +1,31 @@
--- Orchestrator state.
+-- Facts, not state.
 --
--- The point of this schema is timestamps more than state: every metric the dashboard reports is
--- derived from transitions recorded here. `issues.labeled_at` in particular is the origin of MTTR
--- and cannot be recovered from any external API after the fact.
+-- No table here stores a status. Rows record what was observed and when; every status is a pure
+-- function of those rows (see `app/core/state.py`). v1 stored `issues.state`, wrote it from seven
+-- call sites, and had the metrics and the dashboard each recompute parts of it differently — which
+-- produced a session error overwriting a merged outcome, two dashboard panels disagreeing about the
+-- same issue, and an escalation guard that collapsed whenever another path reset the column.
+--
+-- `issues.first_labeled_at` is the one irreplaceable value: it is the MTTR origin and cannot be
+-- recovered from any external API after the fact.
 
 PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
--- Webhook delivery GUIDs. GitHub sends no timestamp header, so storing delivery ids is the only
--- available replay defence, and redeliveries reuse the original GUID.
-CREATE TABLE IF NOT EXISTS deliveries (
-    delivery_id TEXT PRIMARY KEY,
-    event       TEXT NOT NULL,
-    action      TEXT,
-    received_at REAL NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS issues (
-    number      INTEGER PRIMARY KEY,
-    title       TEXT,
-    klass       TEXT,           -- class:* label, for the variety breakdown
-    labeled_at  REAL NOT NULL,  -- MTTR origin
-    state       TEXT NOT NULL,  -- pending|running|blocked|pr_open|merged|failed|escalated
-    updated_at  REAL NOT NULL
+    number             INTEGER PRIMARY KEY,
+    title              TEXT,
+    klass              TEXT,           -- class:* label, for the variety breakdown
+    first_labeled_at   REAL NOT NULL,  -- MTTR origin; never rewritten
+    -- Set when an operator re-applies the trigger label. "Try again" is then one fact rather than a
+    -- state machine that has to be nudged into the right place.
+    retry_requested_at REAL,
+    updated_at         REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
     session_id        TEXT PRIMARY KEY,
     issue_number      INTEGER NOT NULL,
+    attempt           INTEGER NOT NULL DEFAULT 1,
     url               TEXT,
     tags              TEXT,       -- json array, mirrors what the Devin dashboard shows
     created_at        REAL NOT NULL,
@@ -36,47 +34,29 @@ CREATE TABLE IF NOT EXISTS sessions (
     status_detail     TEXT,
     acus              REAL NOT NULL DEFAULT 0,
     nudges            INTEGER NOT NULL DEFAULT 0,
-    ci_rounds         INTEGER NOT NULL DEFAULT 0,
     ever_blocked      INTEGER NOT NULL DEFAULT 0,  -- sticky: waiting_for_user decays into sleep
-    -- Set once the session can no longer make progress on its own (done, ended, errored, or
-    -- halted on cost). Polling stops here; without it a dead session is polled forever.
-    finished_at       REAL,
-    -- Set when the session can no longer be revived at all: ended, errored, or halted on a cost
-    -- ceiling. Distinct from finished_at, which only means "produced its work product" -- a session
-    -- that opened a pull request and went to sleep is finished but very much revivable, and the
-    -- review-fix loop depends on still being able to message it.
-    closed_at         REAL,
-    -- Separate from finished_at on purpose. Overloading one column meant a session that finished
-    -- while blocked latched finished_at during the nudge branch and could then never report.
-    reported_at       REAL,
-    -- Grace period anchor. Any outbound message stamps this, so the loop does not nudge or
-    -- escalate a session that has not yet had a chance to act on the last thing it was sent.
-    last_message_at   REAL,
+    last_message_at   REAL,       -- grace anchor: stamped by Effects on every outbound message
+    -- Two independent facts. v1 collapsed them into one column, so a session that opened a pull
+    -- request and went to sleep counted as ended and its review-fix messages were silently dropped,
+    -- while a session that finished whilst blocked could never report at all.
+    produced_at       REAL,       -- delivered its work product; still wakeable
+    closed_at         REAL,       -- cannot be revived by any message
+    closed_reason     TEXT,
     structured_output TEXT,
-    -- Filled from the Analytics (insights) endpoint. ACUs are reconciled into `acus` above rather
-    -- than kept separately; these are the figures that endpoint adds on top of a session read.
+    -- From the Analytics endpoint; nothing else supplies these.
     devin_messages    INTEGER,
     user_messages     INTEGER,
-    session_size      TEXT,     -- Devin's own xs/s/m/l/xl classification
+    session_size      TEXT,
     FOREIGN KEY (issue_number) REFERENCES issues (number)
 );
 
--- Full transition log. Kept append-only: the audit trail is part of the deliverable.
+-- Append-only transition log. The audit trail is part of the deliverable.
 CREATE TABLE IF NOT EXISTS session_events (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id    TEXT NOT NULL,
     at            REAL NOT NULL,
     status        TEXT,
     status_detail TEXT
-);
-
-CREATE TABLE IF NOT EXISTS interventions (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id   TEXT,
-    issue_number INTEGER,
-    kind         TEXT NOT NULL,  -- auto_nudge|escalation|human_reply|ci_feedback|review_feedback
-    at           REAL NOT NULL,
-    detail       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS pull_requests (
@@ -87,40 +67,77 @@ CREATE TABLE IF NOT EXISTS pull_requests (
     opened_at     REAL,
     ci_settled_at REAL,          -- all checks complete: splits CI wait from human review wait
     ci_conclusion TEXT,
-    ci_attempts   INTEGER NOT NULL DEFAULT 0,
-    -- The commit a CI failure was last handed back for. Without this the feedback budget is spent
-    -- re-reporting the same red commit on consecutive polls, before Devin can push anything.
-    ci_feedback_sha TEXT,
+    ci_rounds     INTEGER NOT NULL DEFAULT 0,
     merged_at     REAL,
-    closed_at     REAL,
-    state         TEXT
+    closed_at     REAL
 );
 
--- Operational counters (dedup hits, retries, cap trips). Cheap, and they make the reliability
--- tier of the dashboard real rather than decorative.
+-- Open notifications are what `awaiting human` is derived from, and they are the honesty surface:
+-- every bound, stall and failure opens one. Keyed by reason class, so a cost halt after a question
+-- escalation is reported rather than swallowed — v1 deduped on issue state and lost the second,
+-- different reason.
+CREATE TABLE IF NOT EXISTS notifications (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_number INTEGER NOT NULL,
+    reason_class TEXT NOT NULL,
+    session_id   TEXT,
+    detail       TEXT,
+    opened_at    REAL NOT NULL,
+    resolved_at  REAL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_open
+    ON notifications (issue_number, reason_class) WHERE resolved_at IS NULL;
+
+-- The idempotency ledger. Every outward action claims a natural key here before it happens and
+-- confirms afterwards; a failure that provably did nothing releases the key. v1 invented a separate
+-- guard per effect and each one had a hole.
+CREATE TABLE IF NOT EXISTS effects (
+    key        TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL,
+    claimed_at REAL NOT NULL,
+    done_at    REAL
+);
+
+-- Intent recorded by the receiver, drained by the loop. Rows are kept after dispatch: they are the
+-- record of what arrived and when it was handled.
+CREATE TABLE IF NOT EXISTS inbox (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind          TEXT NOT NULL,
+    payload       TEXT NOT NULL,   -- json
+    provenance    TEXT NOT NULL,   -- assigned at ingest, never re-derived
+    created_at    REAL NOT NULL,
+    dispatched_at REAL,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    last_error    TEXT
+);
+
+-- Webhook delivery GUIDs. GitHub sends no timestamp header, so this is the only replay defence
+-- available; note the GUID is outside the signed body (see the limitations in the README).
+CREATE TABLE IF NOT EXISTS deliveries (
+    delivery_id TEXT PRIMARY KEY,
+    event       TEXT NOT NULL,
+    action      TEXT,
+    received_at REAL NOT NULL
+);
+
+-- Anything a human or the system did to help a session along. Drives the autonomy rate.
+CREATE TABLE IF NOT EXISTS interventions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id   TEXT,
+    issue_number INTEGER,
+    kind         TEXT NOT NULL,
+    at           REAL NOT NULL,
+    detail       TEXT
+);
+
 CREATE TABLE IF NOT EXISTS counters (
     name  TEXT PRIMARY KEY,
     value REAL NOT NULL DEFAULT 0
 );
 
--- Intent recorded by the webhook receiver, drained by the reconcile loop.
---
--- The receiver must answer within GitHub's 10 second budget and must not perform side effects, so
--- everything it learns is written here and acted on later. Rows are kept after dispatch rather than
--- deleted: they are the record of what arrived and when it was handled.
-CREATE TABLE IF NOT EXISTS queue (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind          TEXT NOT NULL,
-    payload       TEXT NOT NULL,   -- json
-    created_at    REAL NOT NULL,
-    dispatched_at REAL,
-    -- Retry counter. A transient API error must not destroy intent: issue_comment and
-    -- review_comment have no other source, so a dropped one is a human's answer lost for good.
-    attempts      INTEGER NOT NULL DEFAULT 0,
-    last_error    TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_queue_pending ON queue (dispatched_at, id);
+CREATE INDEX IF NOT EXISTS idx_inbox_pending ON inbox (dispatched_at, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_issue ON sessions (issue_number);
 CREATE INDEX IF NOT EXISTS idx_events_session ON session_events (session_id);
 CREATE INDEX IF NOT EXISTS idx_pr_issue ON pull_requests (issue_number);
+CREATE INDEX IF NOT EXISTS idx_notifications_issue ON notifications (issue_number);

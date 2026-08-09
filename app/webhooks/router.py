@@ -74,12 +74,17 @@ async def github_webhook(request: Request) -> Response:
         repo.bump("webhook_wrong_repo")
         return Response(status_code=202, content="not our repository")
 
-    intent = handlers.to_intent(event, payload, trigger_label=settings.trigger_label)
+    intent = handlers.to_intent(
+        event,
+        payload,
+        trigger_label=settings.trigger_label,
+        own_login=getattr(request.app.state, "own_login", None),
+    )
     if intent is None:
         return Response(status_code=202, content="no action for this event")
 
-    kind, data = intent
-    repo.enqueue(kind, data)
+    kind, data, provenance = intent
+    repo.enqueue(kind, data, provenance=str(provenance))
     repo.bump("webhook_accepted")
     logger.info("queued %s from delivery %s", kind, delivery)
     return Response(status_code=202, content=f"queued: {kind}")

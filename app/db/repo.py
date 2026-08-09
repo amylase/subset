@@ -1,10 +1,15 @@
 """SQLite persistence.
 
-Plain ``sqlite3`` rather than an ORM: the queries here are mostly aggregations for the dashboard,
-which read better as SQL, and the schema is small enough that mapping layers would cost more than
-they return.
+Plain ``sqlite3`` rather than an ORM: the queries are mostly aggregations for the dashboard, which
+read better as SQL, and the schema is small enough that a mapping layer would cost more than it
+returns.
 
-The connection is opened per call. At this scale that is cheap, and it sidesteps the thread-affinity
+Nothing here writes a status. Rows record observations and timestamps; ``app.core.state`` derives
+everything else. The methods that look unusual — the effects ledger, notifications keyed by reason
+class, monotonic timestamp columns — exist because v1's equivalents each had a hole; the reasons are
+on the individual methods.
+
+The connection is opened per call. At this scale that is cheap and it sidesteps the thread-affinity
 rules that bite when a connection is shared between the request path and the background loop.
 """
 
@@ -38,8 +43,8 @@ class Repo:
     def _conn(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path, timeout=15)
         conn.row_factory = sqlite3.Row
-        # `PRAGMA foreign_keys` is per-connection, not persisted like `journal_mode`. Setting it
-        # only in init_schema left every other connection with foreign keys disabled.
+        # Per-connection, unlike `journal_mode`. Setting it once at startup left every other
+        # connection with foreign keys disabled.
         conn.execute("PRAGMA foreign_keys = ON")
         try:
             yield conn
@@ -47,30 +52,11 @@ class Repo:
         finally:
             conn.close()
 
-    #: Columns added after the first release. ``CREATE TABLE IF NOT EXISTS`` cannot introduce a
-    #: column into a database that already exists, so they are applied additively at startup.
-    _MIGRATIONS = (
-        ("sessions", "reported_at", "REAL"),
-        ("sessions", "last_message_at", "REAL"),
-        ("sessions", "closed_at", "REAL"),
-        ("sessions", "devin_messages", "INTEGER"),
-        ("sessions", "user_messages", "INTEGER"),
-        ("sessions", "session_size", "TEXT"),
-        ("pull_requests", "ci_feedback_sha", "TEXT"),
-        ("queue", "attempts", "INTEGER NOT NULL DEFAULT 0"),
-        ("queue", "last_error", "TEXT"),
-    )
-
     def init_schema(self) -> None:
         with self._conn() as conn:
             conn.executescript(_SCHEMA.read_text(encoding="utf-8"))
-            for table, column, decl in self._MIGRATIONS:
-                existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
-                if column not in existing:
-                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")  # noqa: S608
 
     def bump(self, name: str, amount: float = 1) -> None:
-        """Increment an operational counter."""
         with self._conn() as conn:
             conn.execute(
                 "INSERT INTO counters (name, value) VALUES (?, ?) "
@@ -82,123 +68,171 @@ class Repo:
         with self._conn() as conn:
             return {r["name"]: r["value"] for r in conn.execute("SELECT name, value FROM counters")}
 
-    # --- deliveries (idempotency) -----------------------------------------
+    # --- the effects ledger ------------------------------------------------
 
-    def record_delivery(self, delivery_id: str, event: str, action: str | None) -> bool:
-        """Record a delivery id. Returns ``True`` if it is new, ``False`` if already seen.
+    def claim_effect(self, key: str, kind: str) -> bool:
+        """Reserve the right to perform an effect. ``True`` for the first caller only.
 
-        Redelivered webhooks reuse the original GUID, so this catches both GitHub's redelivery
-        button and a replayed request.
+        Every outward action goes claim -> act -> confirm. The claim lands before the action,
+        a crash mid-flight leaves the key held: the effect is not retried, which is the safe
+        direction when retrying means spending money or writing to GitHub twice.
         """
         with self._conn() as conn:
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO deliveries (delivery_id, event, action, received_at) "
-                "VALUES (?, ?, ?, ?)",
-                (delivery_id, event, action, now()),
+            return (
+                conn.execute(
+                    "INSERT OR IGNORE INTO effects (key, kind, claimed_at) VALUES (?, ?, ?)",
+                    (key, kind, now()),
+                ).rowcount
+                == 1
             )
-            return cur.rowcount == 1
 
-    # --- queue (intent recorded by the receiver, drained by the loop) -------
+    def release_effect(self, key: str) -> None:
+        """Give the key back, for a failure that provably did nothing outward.
 
-    def enqueue(self, kind: str, payload: dict[str, Any]) -> int:
+        v1 had no equivalent, so a CI feedback attempt that could not name the failing checks burned
+        the key and the retry never fired once the names became available.
+        """
+        with self._conn() as conn:
+            conn.execute("DELETE FROM effects WHERE key = ? AND done_at IS NULL", (key,))
+
+    def confirm_effect(self, key: str) -> None:
+        with self._conn() as conn:
+            conn.execute("UPDATE effects SET done_at = ? WHERE key = ?", (now(), key))
+
+    def effects(self) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM effects ORDER BY claimed_at")]
+
+    # --- notifications (the honesty surface) -------------------------------
+
+    def open_notification(
+        self, issue_number: int, reason_class: str, *, session_id: str | None, detail: str
+    ) -> bool:
+        """Open a notification. ``True`` if one was not already open for this reason class.
+
+        Keyed by reason class rather than by issue, so a cost halt following a question escalation
+        is still reported. v1 deduped on issue state and swallowed the second, different reason —
+        leaving an issue reading "blocked on a question" while it was actually out of credits.
+        """
+        with self._conn() as conn:
+            return (
+                conn.execute(
+                    "INSERT OR IGNORE INTO notifications "
+                    "(issue_number, reason_class, session_id, detail, opened_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (issue_number, reason_class, session_id, detail[:2000], now()),
+                ).rowcount
+                == 1
+            )
+
+    def resolve_notifications(self, issue_number: int, reason_class: str | None = None) -> int:
+        sql = (
+            "UPDATE notifications SET resolved_at = ?"
+            " WHERE issue_number = ? AND resolved_at IS NULL"
+        )
+        args: tuple[Any, ...] = (now(), issue_number)
+        if reason_class is not None:
+            sql += " AND reason_class = ?"
+            args += (reason_class,)
+        with self._conn() as conn:
+            return conn.execute(sql, args).rowcount
+
+    def open_notifications(self, issue_number: int | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM notifications WHERE resolved_at IS NULL"
+        args: tuple[Any, ...] = ()
+        if issue_number is not None:
+            sql += " AND issue_number = ?"
+            args = (issue_number,)
+        with self._conn() as conn:
+            return [dict(r) for r in conn.execute(sql + " ORDER BY opened_at", args)]
+
+    def notifications(self) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM notifications ORDER BY opened_at")]
+
+    # --- deliveries and inbox ----------------------------------------------
+
+    def record_delivery(self, delivery_id: str, event: str, action: str | None) -> bool:
+        """Record a delivery id. ``True`` if new. Redeliveries reuse the original GUID."""
+        with self._conn() as conn:
+            return (
+                conn.execute(
+                    "INSERT OR IGNORE INTO deliveries (delivery_id, event, action, received_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (delivery_id, event, action, now()),
+                ).rowcount
+                == 1
+            )
+
+    def enqueue(self, kind: str, payload: dict[str, Any], *, provenance: str) -> int:
         with self._conn() as conn:
             cur = conn.execute(
-                "INSERT INTO queue (kind, payload, created_at) VALUES (?, ?, ?)",
-                (kind, json.dumps(payload), now()),
+                "INSERT INTO inbox (kind, payload, provenance, created_at) VALUES (?, ?, ?, ?)",
+                (kind, json.dumps(payload), provenance, now()),
             )
             return int(cur.lastrowid or 0)
 
-    def pending_queue(self, limit: int = 50) -> list[dict[str, Any]]:
+    def pending_inbox(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM queue WHERE dispatched_at IS NULL ORDER BY id LIMIT ?", (limit,)
+                "SELECT * FROM inbox WHERE dispatched_at IS NULL ORDER BY id LIMIT ?", (limit,)
             )
             return [{**dict(r), "payload": json.loads(r["payload"])} for r in rows]
 
-    def mark_dispatched(self, queue_id: int) -> None:
+    def mark_dispatched(self, inbox_id: int) -> None:
         with self._conn() as conn:
-            conn.execute("UPDATE queue SET dispatched_at = ? WHERE id = ?", (now(), queue_id))
+            conn.execute("UPDATE inbox SET dispatched_at = ? WHERE id = ?", (now(), inbox_id))
 
-    def record_queue_failure(self, queue_id: int, error: str, *, max_attempts: int) -> bool:
-        """Record a failed dispatch. Returns ``True`` if the item is now exhausted.
+    def record_inbox_failure(self, inbox_id: int, error: str, *, max_attempts: int) -> bool:
+        """Record a failed dispatch. ``True`` once the item is exhausted.
 
-        An item is retried rather than dropped. ``issue_comment`` and ``review_comment`` have no
-        other source — no polling pass re-derives them — so discarding one on a transient API
-        error loses a human's answer permanently.
+        Retried rather than dropped: forwarded comments have no other source, so discarding one on a
+        transient API error loses a human's answer permanently.
         """
         with self._conn() as conn:
             row = conn.execute(
-                "UPDATE queue SET attempts = attempts + 1, last_error = ? WHERE id = ? "
+                "UPDATE inbox SET attempts = attempts + 1, last_error = ? WHERE id = ? "
                 "RETURNING attempts",
-                (error[:500], queue_id),
+                (error[:500], inbox_id),
             ).fetchone()
-            attempts = int(row["attempts"]) if row else max_attempts
-            if attempts >= max_attempts:
-                conn.execute("UPDATE queue SET dispatched_at = ? WHERE id = ?", (now(), queue_id))
+            if row is None:
+                return False
+            if int(row["attempts"]) >= max_attempts:
+                conn.execute("UPDATE inbox SET dispatched_at = ? WHERE id = ?", (now(), inbox_id))
                 return True
             return False
 
     # --- issues ------------------------------------------------------------
 
-    def upsert_issue(self, number: int, title: str, klass: str | None, labeled_at: float) -> bool:
-        """Register an issue as wanted. Returns ``True`` if newly registered.
+    def register_issue(self, number: int, title: str, klass: str | None) -> bool:
+        """Record an issue as wanted. ``True`` if newly registered.
 
-        ``labeled_at`` is only written on first insert: it is the MTTR origin, and re-labelling must
-        not reset the clock and flatter the numbers.
+        ``first_labeled_at`` is written once. It is the MTTR origin, and re-labelling must not reset
+        the clock and flatter every duration.
         """
-        with self._conn() as conn:
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO issues (number, title, klass, labeled_at, state, updated_at)"
-                " VALUES (?, ?, ?, ?, 'pending', ?)",
-                (number, title, klass, labeled_at, now()),
-            )
-            return cur.rowcount == 1
-
-    #: Once an issue reaches one of these, session-derived state must not move it. A merged pull
-    #: request is the outcome; a session that later errors or is cancelled does not un-merge it.
-    _STICKY_ISSUE_STATES = ("merged",)
-
-    def set_issue_state(self, number: int, state: str, *, force: bool = False) -> bool:
-        """Set issue state. Returns ``True`` if it was written.
-
-        Refuses to move an issue out of a sticky terminal state unless ``force`` is given, so a
-        late session transition cannot overwrite a recorded outcome and desynchronise the metrics
-        from the dashboard.
-        """
-        with self._conn() as conn:
-            placeholders = ",".join("?" * len(self._STICKY_ISSUE_STATES))
-            sql = "UPDATE issues SET state = ?, updated_at = ? WHERE number = ?"
-            args: tuple[Any, ...] = (state, now(), number)
-            if not force:
-                sql += f" AND state NOT IN ({placeholders})"  # noqa: S608
-                args += self._STICKY_ISSUE_STATES
-            return conn.execute(sql, args).rowcount == 1
-
-    def reopen_issue(self, number: int) -> bool:
-        """Return a stalled issue to ``pending`` so a new session can be started for it.
-
-        Without this there is no path back: ``upsert_issue`` is ``INSERT OR IGNORE``, so re-applying
-        the label to an issue whose session errored is a no-op and the issue is stuck forever.
-        """
+        ts = now()
         with self._conn() as conn:
             return (
                 conn.execute(
-                    "UPDATE issues SET state = 'pending', updated_at = ? "
-                    "WHERE number = ? AND state IN ('failed', 'escalated')",
-                    (now(), number),
+                    "INSERT OR IGNORE INTO issues "
+                    "(number, title, klass, first_labeled_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (number, title, klass, ts, ts),
                 ).rowcount
                 == 1
             )
 
-    def issues(self, state: str | None = None) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM issues"
-        args: tuple[Any, ...] = ()
-        if state:
-            sql += " WHERE state = ?"
-            args = (state,)
-        sql += " ORDER BY number"
+    def request_retry(self, number: int) -> None:
+        """Record that an operator asked for another attempt."""
+        ts = now()
         with self._conn() as conn:
-            return [dict(r) for r in conn.execute(sql, args)]
+            conn.execute(
+                "UPDATE issues SET retry_requested_at = ?, updated_at = ? WHERE number = ?",
+                (ts, ts, number),
+            )
+
+    def issues(self) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM issues ORDER BY number")]
 
     def issue(self, number: int) -> dict[str, Any] | None:
         with self._conn() as conn:
@@ -208,18 +242,24 @@ class Repo:
     # --- sessions ----------------------------------------------------------
 
     def create_session(
-        self, session_id: str, issue_number: int, url: str | None, tags: list[str]
+        self,
+        session_id: str,
+        issue_number: int,
+        *,
+        url: str | None,
+        tags: list[str],
+        attempt: int,
     ) -> None:
         ts = now()
         with self._conn() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO sessions "
-                "(session_id, issue_number, url, tags, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (session_id, issue_number, url, json.dumps(tags), ts, ts),
+                "(session_id, issue_number, attempt, url, tags, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (session_id, issue_number, attempt, url, json.dumps(tags), ts, ts),
             )
 
-    def update_session(
+    def record_poll(
         self,
         session_id: str,
         *,
@@ -228,32 +268,26 @@ class Repo:
         acus: float,
         structured_output: Any | None = None,
         blocked: bool = False,
-        finished: bool = False,
-        closed: bool = False,
+        produced: bool = False,
+        closed_reason: str | None = None,
     ) -> bool:
-        """Persist a poll result. Returns ``True`` when the status pair changed.
+        """Persist a poll result. ``True`` when the status pair changed.
 
-        Three fields are deliberately monotonic:
+        Four columns are monotonic on purpose:
 
         ``ever_blocked`` — a session that stopped to ask a question decays into
-        ``suspended/inactivity`` once it sleeps, so the blocked observation must be latched or it is
-        lost between polls.
+        ``suspended/inactivity`` once it sleeps, so the observation must be latched or it is lost.
 
-        ``finished_at`` — written once, when the session has produced its work product.
+        ``acus`` — takes the maximum. A payload omitting ``acus_consumed`` would otherwise erase
+        recorded spend, understating cost and re-opening the global budget. Devin's counter only
+        grows, so ``MAX`` is the faithful reading.
 
-        ``closed_at`` — written once, when the session can no longer be revived at all. Kept
-        separate: a session that opened a pull request and went to sleep is finished but still
-        wakeable, and the review-fix loop depends on being able to message it.
-
-        ``acus`` — takes the maximum rather than the last value. A poll whose payload omits
-        ``acus_consumed`` would otherwise erase recorded spend, understating cost and re-opening the
-        global budget. Devin's ACU counter only ever grows, so ``MAX`` is the faithful reading.
+        ``produced_at`` and ``closed_at`` — written once each, and independent of one another.
         """
         ts = now()
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT status, status_detail, finished_at FROM sessions WHERE session_id = ?",
-                (session_id,),
+                "SELECT status, status_detail FROM sessions WHERE session_id = ?", (session_id,)
             ).fetchone()
             if row is None:
                 raise KeyError(f"no such session: {session_id}")
@@ -263,8 +297,9 @@ class Repo:
                 " updated_at = ?,"
                 " ever_blocked = MAX(ever_blocked, ?),"
                 " structured_output = COALESCE(?, structured_output),"
-                " finished_at = COALESCE(finished_at, ?),"
-                " closed_at = COALESCE(closed_at, ?)"
+                " produced_at = COALESCE(produced_at, ?),"
+                " closed_at = COALESCE(closed_at, ?),"
+                " closed_reason = COALESCE(closed_reason, ?)"
                 " WHERE session_id = ?",
                 (
                     status,
@@ -273,8 +308,9 @@ class Repo:
                     ts,
                     1 if blocked else 0,
                     json.dumps(structured_output) if structured_output is not None else None,
-                    ts if finished else None,
-                    ts if closed else None,
+                    ts if produced else None,
+                    ts if closed_reason else None,
+                    closed_reason,
                     session_id,
                 ),
             )
@@ -286,26 +322,41 @@ class Repo:
                 )
             return changed
 
-    def bump_session(self, session_id: str, column: str) -> None:
-        """Increment ``nudges`` or ``ci_rounds``."""
-        if column not in {"nudges", "ci_rounds"}:
-            raise ValueError(f"not a counter column: {column}")
+    def close_session(self, session_id: str, reason: str) -> bool:
+        """Stop tracking a session, for reasons the status pair does not express."""
         with self._conn() as conn:
-            conn.execute(
-                f"UPDATE sessions SET {column} = {column} + 1 WHERE session_id = ?",  # noqa: S608
-                (session_id,),
+            return (
+                conn.execute(
+                    "UPDATE sessions SET closed_at = ?, closed_reason = ? "
+                    "WHERE session_id = ? AND closed_at IS NULL",
+                    (now(), reason, session_id),
+                ).rowcount
+                == 1
             )
 
     def mark_message_sent(self, session_id: str) -> None:
-        """Stamp the grace-period anchor after sending anything to a session.
-
-        The loop must not nudge or escalate a session that has not yet had a chance to act on the
-        last message. Without this, forwarding a human's answer is immediately followed — in the
-        same tick — by another escalation, because the session still reads ``waiting_for_user``.
-        """
+        """Stamp the grace anchor. Called only by ``Effects`` on a successful send."""
         with self._conn() as conn:
             conn.execute(
                 "UPDATE sessions SET last_message_at = ? WHERE session_id = ?", (now(), session_id)
+            )
+
+    def bump_nudges(self, session_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE sessions SET nudges = nudges + 1 WHERE session_id = ?", (session_id,)
+            )
+
+    def reset_budgets(self, session_id: str) -> None:
+        """Grant a fresh nudge and CI budget after a human takes over and hands back.
+
+        Without this the loop re-enters the exhausted branch on the next poll and re-raises the same
+        notification the human just answered — the comment-spam loop, on a second path.
+        """
+        with self._conn() as conn:
+            conn.execute("UPDATE sessions SET nudges = 0 WHERE session_id = ?", (session_id,))
+            conn.execute(
+                "UPDATE pull_requests SET ci_rounds = 0 WHERE session_id = ?", (session_id,)
             )
 
     def apply_insight(
@@ -317,49 +368,21 @@ class Repo:
         user_messages: int | None,
         session_size: str | None,
     ) -> bool:
-        """Merge a row from the Analytics endpoint into a session we already know about.
+        """Merge an Analytics row into a session we created. ``False`` for anything else.
 
-        ACUs go into the same ``acus`` column under ``MAX``, so the analytics figure and the
-        per-session read reconcile to the higher of the two rather than fighting each other. The
-        message counts and size classification exist only here.
-
-        Returns ``False`` for a session id we did not create — the org may contain sessions from
-        other sources, and only our own belong in these metrics.
+        Sparse fields use ``COALESCE`` so a partial row cannot null out values this endpoint is the
+        sole source of; ACUs use ``MAX`` so analytics and the per-session read settle on the higher
+        figure rather than fighting.
         """
         with self._conn() as conn:
             return (
                 conn.execute(
-                    "UPDATE sessions SET acus = MAX(acus, ?), devin_messages = ?,"
-                    " user_messages = ?, session_size = ? WHERE session_id = ?",
+                    "UPDATE sessions SET acus = MAX(acus, ?),"
+                    " devin_messages = COALESCE(?, devin_messages),"
+                    " user_messages = COALESCE(?, user_messages),"
+                    " session_size = COALESCE(?, session_size)"
+                    " WHERE session_id = ?",
                     (acus, devin_messages, user_messages, session_size, session_id),
-                ).rowcount
-                == 1
-            )
-
-    def close_session(self, session_id: str) -> bool:
-        """Stop tracking a session. Used by the watchdog for what the phases do not cover."""
-        with self._conn() as conn:
-            return (
-                conn.execute(
-                    "UPDATE sessions SET closed_at = ? WHERE session_id = ? AND closed_at IS NULL",
-                    (now(), session_id),
-                ).rowcount
-                == 1
-            )
-
-    def clear_nudges(self, session_id: str) -> None:
-        """Reset the nudge budget, used when a human takes over and hands back."""
-        with self._conn() as conn:
-            conn.execute("UPDATE sessions SET nudges = 0 WHERE session_id = ?", (session_id,))
-
-    def mark_reported(self, session_id: str) -> bool:
-        """Claim the right to write the completion comment. ``True`` for the first caller only."""
-        with self._conn() as conn:
-            return (
-                conn.execute(
-                    "UPDATE sessions SET reported_at = ? "
-                    "WHERE session_id = ? AND reported_at IS NULL",
-                    (now(), session_id),
                 ).rowcount
                 == 1
             )
@@ -370,9 +393,8 @@ class Repo:
         if issue_number is not None:
             sql += " WHERE issue_number = ?"
             args = (issue_number,)
-        sql += " ORDER BY created_at"
         with self._conn() as conn:
-            return [dict(r) for r in conn.execute(sql, args)]
+            return [dict(r) for r in conn.execute(sql + " ORDER BY created_at", args)]
 
     def session(self, session_id: str) -> dict[str, Any] | None:
         with self._conn() as conn:
@@ -394,10 +416,15 @@ class Repo:
             return [
                 dict(r)
                 for r in conn.execute(
-                    "SELECT * FROM session_events WHERE session_id = ? ORDER BY at",
-                    (session_id,),
+                    "SELECT * FROM session_events WHERE session_id = ? ORDER BY at", (session_id,)
                 )
             ]
+
+    def total_acus(self) -> float:
+        with self._conn() as conn:
+            return float(
+                conn.execute("SELECT COALESCE(SUM(acus), 0) AS t FROM sessions").fetchone()["t"]
+            )
 
     # --- interventions -----------------------------------------------------
 
@@ -425,29 +452,19 @@ class Repo:
         session_id: str | None,
         url: str | None,
         opened_at: float | None,
-        state: str,
     ) -> bool:
         with self._conn() as conn:
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO pull_requests "
-                "(pr_number, issue_number, session_id, url, opened_at, state) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (pr_number, issue_number, session_id, url, opened_at, state),
+            return (
+                conn.execute(
+                    "INSERT OR IGNORE INTO pull_requests "
+                    "(pr_number, issue_number, session_id, url, opened_at) VALUES (?, ?, ?, ?, ?)",
+                    (pr_number, issue_number, session_id, url, opened_at),
+                ).rowcount
+                == 1
             )
-            return cur.rowcount == 1
 
     def update_pr(self, pr_number: int, **fields: Any) -> None:
-        allowed = {
-            "state",
-            "merged_at",
-            "closed_at",
-            "ci_settled_at",
-            "ci_conclusion",
-            "ci_attempts",
-            "ci_feedback_sha",
-            "issue_number",
-            "session_id",
-        }
+        allowed = {"merged_at", "closed_at", "ci_settled_at", "ci_conclusion", "ci_rounds"}
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"not updatable: {sorted(unknown)}")
@@ -460,18 +477,14 @@ class Repo:
                 (*fields.values(), pr_number),
             )
 
-    def pull_requests(self) -> list[dict[str, Any]]:
+    def pull_requests(self, issue_number: int | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM pull_requests"
+        args: tuple[Any, ...] = ()
+        if issue_number is not None:
+            sql += " WHERE issue_number = ?"
+            args = (issue_number,)
         with self._conn() as conn:
-            return [dict(r) for r in conn.execute("SELECT * FROM pull_requests ORDER BY pr_number")]
-
-    def open_pull_requests(self) -> list[dict[str, Any]]:
-        with self._conn() as conn:
-            return [
-                dict(r)
-                for r in conn.execute(
-                    "SELECT * FROM pull_requests WHERE merged_at IS NULL AND closed_at IS NULL"
-                )
-            ]
+            return [dict(r) for r in conn.execute(sql + " ORDER BY pr_number", args)]
 
     def pull_request(self, pr_number: int) -> dict[str, Any] | None:
         with self._conn() as conn:
@@ -480,22 +493,12 @@ class Repo:
             ).fetchone()
             return dict(row) if row else None
 
-    def pr_for_issue(self, issue_number: int) -> dict[str, Any] | None:
-        """The pull request that represents this issue's outcome.
-
-        A merged one wins over a newer unmerged one. Devin can open more than one pull request for
-        an issue, and taking simply the highest number reported the issue as unresolved even though
-        an earlier pull request had merged.
-        """
+    def tracked_pull_requests(self) -> list[dict[str, Any]]:
+        """Pull requests still worth polling: neither merged nor closed."""
         with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM pull_requests WHERE issue_number = ?"
-                " ORDER BY (merged_at IS NOT NULL) DESC, pr_number DESC LIMIT 1",
-                (issue_number,),
-            ).fetchone()
-            return dict(row) if row else None
-
-    def total_acus(self) -> float:
-        with self._conn() as conn:
-            row = conn.execute("SELECT COALESCE(SUM(acus), 0) AS t FROM sessions").fetchone()
-            return float(row["t"])
+            return [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM pull_requests WHERE merged_at IS NULL AND closed_at IS NULL"
+                )
+            ]

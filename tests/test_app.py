@@ -1,9 +1,9 @@
 """The application seams.
 
-Two things are checked here that unit tests structurally cannot: that the admin write endpoints are
-actually guarded, and that the metric functions work against rows a real ``Repo`` produces rather
-than against hand-built dictionaries. The latter is what catches a schema rename — every metric test
-would stay green while the dashboard broke in production.
+Two things checked here that unit tests structurally cannot: that the admin write endpoints are
+actually guarded, and that the whole read path works against rows a real ``Repo`` produced. The
+latter catches a schema rename, which would otherwise break the dashboard in production while every
+unit test stayed green.
 """
 
 from __future__ import annotations
@@ -12,33 +12,46 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.metrics import compute
-from app.db.repo import Repo
+from app.core.state import IssueStatus
+
+ENV = {
+    "DEVIN_API_KEY": "cog_test",
+    "DEVIN_ORG_ID": "org-test",
+    "GITHUB_TOKEN": "gh_test",
+    "WEBHOOK_SECRET": "0123456789abcdef0123",
+    "DB_PATH": "",  # filled per test
+    "SELF_LOGIN": "orchestrator-bot",
+    # The loop ticks once immediately on startup. Push the slow passes far out so no test reaches
+    # the network with placeholder credentials.
+    "SESSION_POLL_INTERVAL": "3600",
+    "RESYNC_INTERVAL": "864000",
+    "PR_POLL_INTERVAL": "864000",
+}
+
+
+def _build(tmp_path, monkeypatch, **overrides):
+    from app.config import get_settings
+
+    for name, value in {**ENV, "DB_PATH": str(tmp_path / "app.db"), **overrides}.items():
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    get_settings.cache_clear()
+    from app.main import app
+
+    return app, get_settings
 
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("DEVIN_API_KEY", "cog_test")
-    monkeypatch.setenv("DEVIN_ORG_ID", "org-test")
-    monkeypatch.setenv("GITHUB_TOKEN", "gh_test")
-    monkeypatch.setenv("WEBHOOK_SECRET", "secret")
-    monkeypatch.setenv("ADMIN_TOKEN", "admin-secret")
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "app.db"))
-    monkeypatch.setenv("SESSION_POLL_INTERVAL", "3600")
-    # The loop ticks once immediately on startup. Push the resync and analytics passes far out so
-    # this test never reaches the network with placeholder credentials.
-    monkeypatch.setenv("RESYNC_INTERVAL", "864000")
-
-    from app.config import get_settings
-
-    get_settings.cache_clear()
-    from app.main import app
-
+    app, get_settings = _build(tmp_path, monkeypatch, ADMIN_TOKEN="admin-secret")
     with TestClient(app) as test_client:
         yield test_client
     get_settings.cache_clear()
 
 
-def test_health_and_read_endpoints_respond(client):
+def test_the_read_endpoints_respond(client):
     assert client.get("/healthz").status_code == 200
     assert client.get("/api/metrics").status_code == 200
     assert client.get("/api/issues").status_code == 200
@@ -47,13 +60,20 @@ def test_health_and_read_endpoints_respond(client):
     assert "Resolution rate" in dashboard.text
 
 
-def test_admin_endpoints_reject_a_wrong_token(client):
-    response = client.post("/api/admin/issues/5", headers={"X-Admin-Token": "guess"})
+def test_the_identity_is_resolved_at_startup(client):
+    assert client.app.state.own_login == "orchestrator-bot"
+
+
+@pytest.mark.parametrize("headers", [{}, {"X-Admin-Token": "guess"}])
+def test_admin_endpoints_reject_a_bad_token(client, headers):
+    assert client.post("/api/admin/issues/5", headers=headers).status_code == 401
+
+
+def test_a_non_ascii_token_is_rejected_not_a_server_error(client):
+    """Starlette decodes headers as latin-1 and `compare_digest` raises on non-ASCII `str`, so an
+    unencoded comparison turned this into a 500 — an oracle for whether the API is enabled."""
+    response = client.post("/api/admin/issues/5", headers={"X-Admin-Token": "ÿ".encode("latin-1")})
     assert response.status_code == 401
-
-
-def test_admin_endpoints_reject_a_missing_token(client):
-    assert client.post("/api/admin/issues/5").status_code == 401
 
 
 def test_admin_endpoints_accept_the_configured_token(client):
@@ -62,25 +82,16 @@ def test_admin_endpoints_accept_the_configured_token(client):
     assert response.json() == {"status": "queued", "issue": 5}
 
 
+def test_admin_reconcile_runs_a_tick(client):
+    before = client.app.state.orchestrator._tick
+    response = client.post("/api/admin/reconcile", headers={"X-Admin-Token": "admin-secret"})
+    assert response.status_code == 200
+    assert client.app.state.orchestrator._tick > before
+
+
 def test_the_admin_api_is_absent_unless_configured(tmp_path, monkeypatch):
     """Unset means off, and the 404 does not reveal whether a token was supplied."""
-    for name, value in {
-        "DEVIN_API_KEY": "k",
-        "DEVIN_ORG_ID": "org-x",
-        "GITHUB_TOKEN": "g",
-        "WEBHOOK_SECRET": "s",
-        "DB_PATH": str(tmp_path / "b.db"),
-        "SESSION_POLL_INTERVAL": "3600",
-        "RESYNC_INTERVAL": "864000",
-    }.items():
-        monkeypatch.setenv(name, value)
-    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
-
-    from app.config import get_settings
-
-    get_settings.cache_clear()
-    from app.main import app
-
+    app, get_settings = _build(tmp_path, monkeypatch, ADMIN_TOKEN=None)
     with TestClient(app) as test_client:
         assert test_client.post("/api/admin/reconcile").status_code == 404
         assert (
@@ -92,34 +103,61 @@ def test_the_admin_api_is_absent_unless_configured(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
-def test_metrics_read_the_columns_the_repo_actually_writes(tmp_path):
-    """A column rename would break the dashboard while every metrics unit test stayed green."""
-    repo = Repo(str(tmp_path / "seam.db"))
-    repo.upsert_issue(2, "a bug", "class:logic-bug", labeled_at=0.0)
-    repo.create_session("devin-1", 2, "https://app.devin.ai/sessions/devin-1", ["issue:2"])
-    repo.update_session(
+def test_an_empty_webhook_secret_fails_at_startup(tmp_path, monkeypatch):
+    """An empty secret still produces a valid HMAC, so the whole trust model would collapse
+    silently — including the `author_association` gate, which becomes forgeable."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        _build(tmp_path, monkeypatch, WEBHOOK_SECRET="")[1]()
+
+
+def test_the_dashboard_renders_real_rows(client):
+    """Rendered empty, the route could return an empty table and still pass."""
+    repo = client.app.state.repo
+    repo.register_issue(2, "a stubborn bug", "class:security")
+    repo.create_session("devin-1", 2, url=None, tags=["issue:2"], attempt=1)
+    repo.record_poll("devin-1", status="running", status_detail="finished", acus=6.0, produced=True)
+    labeled_at = repo.issue(2)["first_labeled_at"]
+    repo.upsert_pr(10, issue_number=2, session_id="devin-1", url="u", opened_at=labeled_at + 100)
+    repo.update_pr(10, merged_at=labeled_at + 500)
+    repo.register_issue(3, "waiting its turn", None)
+
+    page = client.get("/").text
+    assert "a stubborn bug" in page
+    assert "waiting its turn" in page
+    assert "s-merged" in page
+    assert "s-queued" in page
+    assert "6.00" in page
+
+
+def test_metrics_read_the_columns_the_repo_actually_writes(client):
+    repo = client.app.state.repo
+    repo.register_issue(2, "a bug", "class:logic-bug")
+    repo.create_session("devin-1", 2, url="u", tags=[], attempt=1)
+    repo.record_poll(
         "devin-1",
         status="running",
         status_detail="finished",
         acus=6.0,
         structured_output={"outcome": "fixed"},
-        finished=True,
+        produced=True,
     )
-    repo.upsert_pr(
-        10,
-        issue_number=2,
-        session_id="devin-1",
-        url="https://github.com/o/r/pull/10",
-        opened_at=100.0,
-        state="open",
+    labeled_at = repo.issue(2)["first_labeled_at"]
+    repo.upsert_pr(10, issue_number=2, session_id="devin-1", url="u", opened_at=labeled_at + 100)
+    repo.update_pr(
+        10, ci_settled_at=labeled_at + 200, ci_conclusion="success", merged_at=labeled_at + 500
     )
-    repo.update_pr(10, ci_settled_at=200.0, ci_conclusion="success", merged_at=500.0)
+
+    view = client.app.state.orchestrator.issue_view()
+    assert view[0]["status"] is IssueStatus.MERGED
 
     m = compute(
-        issues=repo.issues(),
+        view=view,
         sessions=repo.sessions(),
         pull_requests=repo.pull_requests(),
         interventions=repo.interventions(),
+        notifications=repo.notifications(),
         counters=repo.counters(),
         acu_unit_cost_usd=2.0,
         manual_effort_hours_per_issue=4.0,

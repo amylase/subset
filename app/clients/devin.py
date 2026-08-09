@@ -129,11 +129,21 @@ class DevinClient:
     async def list_messages(self, session_id: str, *, first: int = 50) -> Any:
         return await self._call("GET", f"/sessions/{session_id}/messages", params={"first": first})
 
-    async def insights(self, *, tags: list[str] | None = None, first: int = 100) -> Any:
-        """Session analytics: ACUs, message counts, PR states, Devin's own analysis."""
-        params: dict[str, Any] = {"first": first}
+    async def insights(
+        self, *, tags: list[str] | None = None, first: int = 100, after: str | None = None
+    ) -> Any:
+        """Session analytics: ACUs, message counts, size classification.
+
+        The documentation renders these parameters as nested under a ``qs`` object, which is an
+        OpenAPI artefact — the validator reads them at the top level. Confirmed against the live
+        endpoint: ``?first=201`` returns 422 naming ``query.first``, so ``first`` maxes at 200 and
+        flat keys are correct. httpx encodes a list as repeated keys, which the endpoint accepts.
+        """
+        params: dict[str, Any] = {"first": min(first, 200)}
         if tags:
             params["tags"] = tags
+        if after:
+            params["after"] = after
         return await self._call("GET", "/sessions/insights", params=params)
 
     # --- playbooks and schedules ------------------------------------------

@@ -1,24 +1,27 @@
-"""Mapping Devin session state onto orchestrator state.
+"""Interpreting stored facts.
 
-This module is deliberately pure: no I/O, no clock, no database. The reconcile loop decides what to
-*do*; this module decides what a session currently *is*. Keeping the two apart is what makes the
-interesting logic testable without mocks.
+Deliberately pure: no I/O, no clock, no database. The reconcile loop decides what to *do*; this
+module decides what things currently *are*. Keeping the two apart is what makes the interesting
+logic testable without mocks, and it is why the same function can back both the metrics and the
+dashboard — v1 let them diverge because each recomputed parts of a stored status column.
 
-The subtlety worth knowing before editing:
+Three ideas carry the weight:
 
-* The API sample loop in Devin's docs breaks on ``status in ('exit', 'error', 'suspended')``. That
-  is wrong in both directions. A session whose task is finished can still report ``running`` with
-  ``status_detail == 'finished'``, and ``suspended`` is usually just sleep, not an ending.
-* Sessions sleep automatically after ~0.1 ACU of inactivity, so a session that stopped to ask a
-  question decays from ``running/waiting_for_user`` into ``suspended/inactivity``. The blocked state
-  is therefore transient and must be latched when first observed, not inferred later.
+* **Status is derived, never stored.** :func:`issue_status` is the only definition of where an issue
+  stands. Nothing writes a status column, so nothing can disagree with it.
+* **Liveness is one function.** :func:`liveness` collapses Devin's dozen-odd status pairs into the
+  only three answers the orchestrator needs, and it is consulted in exactly one place.
+* **Produced and closed are different.** A session that opened a pull request and went to sleep has
+  produced its work and is still wakeable. v1 conflated them and silently dropped the review-fix
+  messages that the whole design depends on.
 """
 
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any
 
-# --- Devin vocabulary --------------------------------------------------------
+# --- Devin's vocabulary ------------------------------------------------------
 
 STATUS_NEW = "new"
 STATUS_CLAIMED = "claimed"
@@ -34,15 +37,11 @@ DETAIL_WAITING_FOR_APPROVAL = "waiting_for_approval"
 DETAIL_FINISHED = "finished"
 DETAIL_INACTIVITY = "inactivity"
 DETAIL_USER_REQUEST = "user_request"
-
 DETAIL_ERROR = "error"
 
-#: ``suspended`` details that mean a cost or quota ceiling stopped the work. These are the only
-#: suspensions that are genuinely bad news; everything else is sleep.
-#:
-#: The full documented set matters here. A halt this list misses is classified as sleep, so the
-#: orchestrator keeps sending wake-up messages that cannot succeed, never escalates, and shows the
-#: issue as running — the exact failure the cost controls exist to prevent.
+#: ``suspended`` details that mean a cost or quota ceiling stopped the work. No message revives a
+#: session in one of these, so misclassifying one as sleep means the loop keeps trying to wake
+#: something that cannot wake — which is exactly what the cost controls exist to prevent.
 COST_HALT_DETAILS = frozenset(
     {
         "usage_limit_exceeded",
@@ -56,145 +55,155 @@ COST_HALT_DETAILS = frozenset(
     }
 )
 
+#: ``suspended`` details that are ordinary rest. A message wakes these.
+SLEEP_DETAILS = frozenset({DETAIL_INACTIVITY, DETAIL_USER_REQUEST})
 
-class Phase(StrEnum):
-    """Where a session is in its lifecycle."""
 
-    STARTING = "starting"
-    IN_PROGRESS = "in_progress"
-    BLOCKED = "blocked"
-    COMPLETE = "complete"
+# --- session liveness --------------------------------------------------------
+
+
+class Liveness(StrEnum):
+    """The only three answers the orchestrator needs about a session."""
+
+    LIVE = "live"
     SLEEPING = "sleeping"
-    HALTED_COST = "halted_cost"
-    RESUMING = "resuming"
-    ENDED = "ended"
-    FAILED = "failed"
+    CLOSED = "closed"
 
 
-#: Phases from which a session cannot come back on its own.
-TERMINAL_PHASES = frozenset({Phase.ENDED, Phase.FAILED})
+def liveness(session: dict[str, Any]) -> Liveness:
+    """Whether a session may be polled and messaged.
 
-#: Phases after which polling should stop. ``HALTED_COST`` is included because a quota or credit
-#: ceiling will not lift on its own: the orchestrator has already escalated, and continuing to poll
-#: only burns API calls and inflates counters.
-CLOSED_PHASES = frozenset({Phase.ENDED, Phase.FAILED, Phase.HALTED_COST})
-
-#: Phases in which the session is awake and spending ACUs.
-ACTIVE_PHASES = frozenset({Phase.STARTING, Phase.IN_PROGRESS, Phase.RESUMING})
-
-#: Phases that a message can revive. Devin resumes a suspended session on receiving one.
-WAKEABLE_PHASES = frozenset({Phase.SLEEPING, Phase.BLOCKED, Phase.COMPLETE})
-
-
-def classify(status: str | None, status_detail: str | None) -> Phase:
-    """Map a Devin ``(status, status_detail)`` pair onto a :class:`Phase`.
-
-    Unknown values degrade to the closest safe interpretation rather than raising: the API may grow
-    new detail values, and an unrecognised suspension should read as sleep (recoverable), not as
-    failure (which would corrupt the success rate).
+    ``closed_at`` is authoritative: once the loop has decided a session cannot be revived, a later
+    poll cannot argue otherwise. Otherwise the status pair decides, and anything unrecognised reads
+    as ``LIVE`` — the safe direction, because a live session is polled (cheap) rather than abandoned
+    (loses work). The age watchdog is what stops an unrecognised status holding a slot forever.
     """
-    match status:
-        case None:
-            return Phase.STARTING
-        case s if s in (STATUS_NEW, STATUS_CLAIMED):
-            return Phase.STARTING
-        case s if s == STATUS_RESUMING:
-            return Phase.RESUMING
-        case s if s == STATUS_EXIT:
-            return Phase.ENDED
-        case s if s == STATUS_ERROR:
-            return Phase.FAILED
-        case s if s == STATUS_RUNNING:
-            if status_detail == DETAIL_FINISHED:
-                return Phase.COMPLETE
-            if status_detail in (DETAIL_WAITING_FOR_USER, DETAIL_WAITING_FOR_APPROVAL):
-                return Phase.BLOCKED
-            return Phase.IN_PROGRESS
-        case s if s == STATUS_SUSPENDED:
-            if status_detail in COST_HALT_DETAILS:
-                return Phase.HALTED_COST
-            if status_detail == DETAIL_ERROR:
-                # `suspended/error` is a documented pair and is not sleep: no message will revive
-                # it, so treating it as wakeable would poll and nudge a dead session forever.
-                return Phase.FAILED
-            return Phase.SLEEPING
-        case _:
-            return Phase.IN_PROGRESS
+    if session.get("closed_at") is not None:
+        return Liveness.CLOSED
+
+    status, detail = session.get("status"), session.get("status_detail")
+    if status in (STATUS_EXIT, STATUS_ERROR):
+        return Liveness.CLOSED
+    if status == STATUS_SUSPENDED:
+        if detail in COST_HALT_DETAILS or detail == DETAIL_ERROR:
+            return Liveness.CLOSED
+        return Liveness.SLEEPING
+    return Liveness.LIVE
 
 
-def is_work_done(
-    phase: Phase,
-    *,
-    has_structured_output: bool,
-    has_pull_request: bool,
+def closing_reason(session: dict[str, Any]) -> str | None:
+    """Why this session can no longer be revived, or ``None`` if it still can."""
+    status, detail = session.get("status"), session.get("status_detail")
+    if status == STATUS_ERROR:
+        return "error"
+    if status == STATUS_EXIT:
+        return "exit"
+    if status == STATUS_SUSPENDED:
+        if detail in COST_HALT_DETAILS:
+            return f"cost_halt:{detail}"
+        if detail == DETAIL_ERROR:
+            return "error"
+    return None
+
+
+def is_blocked(session: dict[str, Any]) -> bool:
+    """Whether the session is waiting on a human right now."""
+    return session.get("status") == STATUS_RUNNING and session.get("status_detail") in (
+        DETAIL_WAITING_FOR_USER,
+        DETAIL_WAITING_FOR_APPROVAL,
+    )
+
+
+def has_produced(
+    session: dict[str, Any], *, has_structured_output: bool, has_pull_request: bool
 ) -> bool:
-    """Whether the session has produced its work product.
+    """Whether the session has delivered its work product.
 
-    Distinct from the phase on purpose. ``COMPLETE`` is the explicit signal, structured output is
-    the contractual one (the schema is required, so its presence means Devin called
-    ``provide_structured_output`` with ``is_final=true``), and a pull request on a session that has
-    stopped moving is the observable one.
-
-    A pull request on a *running* session is not enough: Devin routinely opens a PR and keeps
-    working on it.
+    Distinct from being closed. ``status_detail == 'finished'`` is the explicit signal; a *final*
+    structured output is the contractual one; a pull request on a session that has stopped moving is
+    the observable one. A pull request on a *working* session is not enough — Devin routinely opens
+    one and keeps going.
     """
-    if phase is Phase.COMPLETE:
+    if session.get("status_detail") == DETAIL_FINISHED:
         return True
     if has_structured_output:
         return True
-    return has_pull_request and phase in (Phase.SLEEPING, Phase.ENDED)
+    return has_pull_request and liveness(session) in (Liveness.SLEEPING, Liveness.CLOSED)
 
 
-def needs_attention(phase: Phase) -> bool:
-    """Phases a human should eventually hear about if they persist."""
-    return phase in (Phase.BLOCKED, Phase.HALTED_COST, Phase.FAILED)
+def is_final_output(structured: Any) -> bool:
+    """Whether structured output represents a finished attempt rather than a progress note.
 
-
-class IssueState(StrEnum):
-    """Issue-level state. This is the denominator the dashboard reports against.
-
-    Metrics are counted per issue, not per session: an issue that needed three sessions and got
-    fixed is one success, not one success and two failures.
+    The schema requires ``outcome``; a session reporting anything outside the terminal set has not
+    finished. v1 treated the mere presence of the object as completion and posted "Devin finished"
+    on an in-progress session.
     """
+    if not isinstance(structured, dict):
+        return False
+    return structured.get("outcome") in ("fixed", "partially_fixed", "could_not_fix")
 
-    PENDING = "pending"
-    RUNNING = "running"
-    BLOCKED = "blocked"
-    PR_OPEN = "pr_open"
+
+# --- issue status ------------------------------------------------------------
+
+
+class IssueStatus(StrEnum):
     MERGED = "merged"
-    ESCALATED = "escalated"
-    FAILED = "failed"
+    AWAITING_HUMAN = "awaiting_human"
+    PR_OPEN = "pr_open"
+    IN_PROGRESS = "in_progress"
+    EXHAUSTED = "exhausted"
+    QUEUED = "queued"
 
 
-#: Issue states from which no further automated work will happen.
-ISSUE_TERMINAL = frozenset({IssueState.MERGED, IssueState.FAILED})
+#: Statuses from which the loop will not start further work on its own.
+TERMINAL_STATUSES = frozenset({IssueStatus.MERGED})
 
 
-def issue_state_for(
-    phase: Phase | None,
-    *,
-    pr_merged: bool,
-    pr_open: bool,
-    escalated: bool,
-    has_session: bool = True,
-) -> IssueState:
-    """Derive the issue-level state. Outcomes observed on GitHub outrank session phase.
+def issue_status(
+    issue: dict[str, Any],
+    sessions: list[dict[str, Any]],
+    pulls: list[dict[str, Any]],
+    open_notifications: list[dict[str, Any]],
+) -> IssueStatus:
+    """Where an issue stands, derived from facts. The single definition, used everywhere.
 
-    ``has_session`` distinguishes "no session yet" from "a session that has not started moving".
-    Without it, an issue held back by the concurrency cap displayed as in progress, which is
-    precisely the wrong reading — it is queued, and the queue depth is what an operator needs to
-    see when work is not flowing.
+    Evaluated in precedence order, first match wins. Merged outranks everything because it is an
+    outcome observed on GitHub: a session that errors afterwards does not un-merge a pull request.
     """
-    if pr_merged:
-        return IssueState.MERGED
-    if escalated:
-        return IssueState.ESCALATED
-    if pr_open:
-        return IssueState.PR_OPEN
-    if not has_session:
-        return IssueState.PENDING
-    if phase is Phase.FAILED:
-        return IssueState.FAILED
-    if phase in (Phase.BLOCKED, Phase.HALTED_COST):
-        return IssueState.BLOCKED
-    return IssueState.RUNNING
+    if any(p.get("merged_at") for p in pulls):
+        return IssueStatus.MERGED
+    if open_notifications:
+        return IssueStatus.AWAITING_HUMAN
+    if any(p.get("opened_at") and not p.get("merged_at") and not p.get("closed_at") for p in pulls):
+        return IssueStatus.PR_OPEN
+    if any(liveness(s) is not Liveness.CLOSED and s.get("produced_at") is None for s in sessions):
+        return IssueStatus.IN_PROGRESS
+    if wants_session(issue, sessions):
+        return IssueStatus.QUEUED
+    return IssueStatus.EXHAUSTED
+
+
+def wants_session(issue: dict[str, Any], sessions: list[dict[str, Any]]) -> bool:
+    """Whether a new session should be started for this issue.
+
+    Two cases: nothing has ever been attempted, or an operator asked for a retry after the newest
+    attempt began. Re-applying the trigger label writes ``retry_requested_at``, which is all the
+    machinery a retry needs — v1 required a state machine to be nudged into exactly the right place
+    and silently did nothing for the most common escalation shape.
+    """
+    if not sessions:
+        return True
+    retry_at = issue.get("retry_requested_at")
+    if retry_at is None:
+        return False
+    return retry_at > max(s["created_at"] for s in sessions)
+
+
+def occupies_slot(session: dict[str, Any]) -> bool:
+    """Whether a session counts against the concurrency cap.
+
+    Not closed, full stop. v1 counted only sessions that were *awake*, so blocked and sleeping
+    sessions escaped the cap entirely — and both resume spending the moment they are messaged, so
+    concurrent spend was unbounded.
+    """
+    return liveness(session) is not Liveness.CLOSED

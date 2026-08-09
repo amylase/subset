@@ -3,12 +3,18 @@
 Deliberately dumb: they script responses and record calls, and contain no logic of their own. The
 orchestrator is what is under test, so anything clever here would be testing the test.
 
-Every fake method mirrors the real client's signature. If a signature drifts, these break loudly
-rather than passing against an interface that no longer exists.
+Two properties are load-bearing and were missing in v1's equivalents:
+
+* **Every coroutine yields.** ``await asyncio.sleep(0)`` before returning, so two ticks driven with
+  ``asyncio.gather`` genuinely interleave. Without it the concurrency test was sequential execution
+  wearing a concurrency costume, and removing the lock left it green.
+* **Signatures mirror the real clients exactly.** A drifted signature would make the whole
+  integration suite test an interface that no longer exists; ``test_clients`` asserts they match.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 
@@ -17,12 +23,13 @@ class FakeDevin:
         self.created: list[dict[str, Any]] = []
         self.messages: list[tuple[str, str]] = []
         self.message_log: dict[str, Any] = {"items": []}
-        #: session_id -> list of responses, consumed one per poll; the last one repeats.
+        #: session_id -> responses, consumed one per poll; the last one repeats.
         self.states: dict[str, list[dict[str, Any]]] = {}
         self.get_calls: list[str] = []
         self.create_error: Exception | None = None
-        #: Rows the analytics endpoint returns. Includes foreign sessions in some tests, because
-        #: the endpoint ignores unknown filters rather than rejecting them.
+        self.message_error: Exception | None = None
+        #: Rows the analytics endpoint returns. Some tests include foreign sessions, because the
+        #: endpoint ignores unknown filters rather than rejecting them.
         self.insight_rows: list[dict[str, Any]] = []
         self.insight_calls: list[Any] = []
         self._next = 1
@@ -61,6 +68,7 @@ class FakeDevin:
         max_acu_limit: int,
         playbook_id: str | None = None,
     ) -> dict[str, Any]:
+        await asyncio.sleep(0)
         if self.create_error is not None:
             raise self.create_error
         session_id = f"devin-{self._next}"
@@ -80,19 +88,27 @@ class FakeDevin:
         return {"session_id": session_id, "url": f"https://app.devin.ai/sessions/{session_id}"}
 
     async def get_session(self, session_id: str) -> dict[str, Any]:
+        await asyncio.sleep(0)
         self.get_calls.append(session_id)
         states = self.states.get(session_id) or [self.state()]
         return states.pop(0) if len(states) > 1 else states[0]
 
     async def send_message(self, session_id: str, message: str) -> None:
+        await asyncio.sleep(0)
+        if self.message_error is not None:
+            raise self.message_error
         self.messages.append((session_id, message))
 
     async def list_messages(self, session_id: str, *, first: int = 50) -> Any:
+        await asyncio.sleep(0)
         return self.message_log
 
-    async def insights(self, *, tags: list[str] | None = None, first: int = 100) -> Any:
-        self.insight_calls.append(tags)
-        return {"items": self.insight_rows}
+    async def insights(
+        self, *, tags: list[str] | None = None, first: int = 100, after: str | None = None
+    ) -> Any:
+        await asyncio.sleep(0)
+        self.insight_calls.append({"tags": tags, "first": first, "after": after})
+        return {"items": self.insight_rows, "has_next_page": False, "end_cursor": None}
 
 
 class FakeGitHub:
@@ -107,6 +123,7 @@ class FakeGitHub:
         self.labelled_issues: list[dict[str, Any]] = []
         self.comment_error: Exception | None = None
         self.get_issue_error: Exception | None = None
+        self.login = "orchestrator-bot"
 
     # -- scripting ----------------------------------------------------------
 
@@ -121,37 +138,49 @@ class FakeGitHub:
     def add_pull(self, number: int, *, sha: str = "sha1", merged: bool = False, state="open"):
         self.pulls[number] = {
             "number": number,
-            "state": "closed" if merged else state,
+            "state": "closed" if merged or state == "closed" else "open",
             "merged_at": "2026-01-01T00:00:00Z" if merged else None,
             "head": {"sha": sha},
         }
 
     # -- the client interface ----------------------------------------------
 
+    async def whoami(self) -> str | None:
+        await asyncio.sleep(0)
+        return self.login
+
     async def get_issue(self, number: int) -> dict[str, Any]:
+        await asyncio.sleep(0)
         if self.get_issue_error is not None:
             raise self.get_issue_error
         return self.issues[number]
 
     async def list_issues_with_label(self, label: str) -> list[dict[str, Any]]:
+        await asyncio.sleep(0)
         return self.labelled_issues
 
     async def comment(self, number: int, body: str) -> None:
+        await asyncio.sleep(0)
         if self.comment_error is not None:
             raise self.comment_error
         self.comments.append((number, body))
 
     async def add_label(self, number: int, label: str) -> None:
+        await asyncio.sleep(0)
         self.labels_added.append((number, label))
 
     async def remove_label(self, number: int, label: str) -> None:
+        await asyncio.sleep(0)
         self.labels_removed.append((number, label))
 
     async def get_pull(self, number: int) -> dict[str, Any]:
+        await asyncio.sleep(0)
         return self.pulls[number]
 
     async def checks_settled(self, sha: str) -> tuple[bool, str]:
+        await asyncio.sleep(0)
         return self.checks.get(sha, (False, "pending"))
 
     async def failed_check_summary(self, sha: str, *, limit: int = 8) -> list[str]:
+        await asyncio.sleep(0)
         return self.failed_checks.get(sha, [])[:limit]

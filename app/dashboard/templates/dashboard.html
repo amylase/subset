@@ -56,12 +56,14 @@
 
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px;
           font-weight: 600; border: 1px solid transparent; }
-  .s-merged   { color: var(--ok);   background: color-mix(in srgb, var(--ok) 12%, transparent); }
-  .s-pr_open  { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
-  .s-running  { color: var(--muted); background: color-mix(in srgb, var(--muted) 12%, transparent); }
-  .s-pending  { color: var(--muted); background: color-mix(in srgb, var(--muted) 12%, transparent); }
-  .s-blocked, .s-escalated { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
-  .s-failed   { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+  .s-merged      { color: var(--ok);     background: color-mix(in srgb, var(--ok) 12%, transparent); }
+  .s-pr_open     { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .s-in_progress { color: var(--muted);  background: color-mix(in srgb, var(--muted) 12%, transparent); }
+  .s-queued      { color: var(--muted);  background: color-mix(in srgb, var(--muted) 12%, transparent); }
+  .s-awaiting_human { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+  .s-exhausted   { color: var(--bad);    background: color-mix(in srgb, var(--bad) 12%, transparent); }
+  .note { border-left: 3px solid var(--warn); padding: 6px 10px; margin: 6px 0; font-size: 12.5px; }
+  .note b { color: var(--warn); }
 
   details { margin-top: 10px; }
   summary { cursor: pointer; color: var(--muted); font-size: 12px; }
@@ -144,10 +146,10 @@
             {% endif %}
           </td>
           <td>{{ (i.klass or "—") | replace("class:", "") }}</td>
-          <td><span class="pill s-{{ i.derived_state }}">{{ i.derived_state | replace("_", " ") }}</span></td>
+          <td><span class="pill s-{{ i.status }}">{{ i.status | replace("_", " ") }}</span></td>
           <td>{% if i.session %}<a href="{{ i.session.url }}">{{ i.session.status or "—" }}{% if i.session.status_detail %}/{{ i.session.status_detail }}{% endif %}</a>{% else %}—{% endif %}</td>
           <td>{% if i.pull_request %}<a href="{{ i.pull_request.url }}">#{{ i.pull_request.pr_number }}</a>{% else %}—{% endif %}</td>
-          <td class="num">{% if i.session %}{{ "%.2f"|format(i.session.acus) }}{% else %}—{% endif %}</td>
+          <td class="num">{% if i.session %}{{ "%.2f"|format(i.session.acus) }}{% if i.attempts > 1 %} <span class="sub">×{{ i.attempts }}</span>{% endif %}{% else %}—{% endif %}</td>
         </tr>
       {% else %}
         <tr><td colspan="7" style="color:var(--muted)">No issues registered yet. Apply the trigger label to start.</td></tr>
@@ -156,6 +158,17 @@
     </table>
   </div>
 
+  {% if m.open_notifications %}
+  <h2>Waiting on a human</h2>
+  <div class="panel">
+    {% for n in m.open_notifications %}
+      <div class="note"><b>{{ n.reason_class | replace("_", " ") }}</b> ·
+        <a href="https://github.com/{{ repo }}/issues/{{ n.issue_number }}">#{{ n.issue_number }}</a>
+        — {{ n.detail | truncate(160) }}</div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
   <h2>Reliability &amp; interventions</h2>
   <div class="panel">
     <details open>
@@ -163,6 +176,7 @@
       <div class="kv">
         {% for k, v in m.session_outcomes.items() %}<div><span>session · {{ k }}</span><span>{{ v }}</span></div>{% endfor %}
         {% for k, v in m.interventions_by_kind.items() %}<div><span>intervention · {{ k }}</span><span>{{ v }}</span></div>{% endfor %}
+        {% for k, v in m.notifications_by_reason.items() %}<div><span>notified · {{ k | replace('_',' ') }}</span><span>{{ v }}</span></div>{% endfor %}
         {% for k, v in m.counters.items() %}<div><span>{{ k | replace("_", " ") }}</span><span>{{ "%g"|format(v) }}</span></div>{% endfor %}
         <div><span>CI first-pass rate</span><span>{{ m.ci_first_pass_rate | pct }}</span></div>
         <div><span>Devin turns per resolution</span><span>{% if m.devin_turns_per_resolution is not none %}{{ "%.0f"|format(m.devin_turns_per_resolution) }}{% else %}—{% endif %}</span></div>

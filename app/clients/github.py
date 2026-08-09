@@ -43,7 +43,8 @@ FAILING_CONCLUSIONS = frozenset(
 
 class GitHubClient:
     def __init__(self, token: str, api_base: str, repo: str, *, on_retry: Any = None) -> None:
-        self._base = f"{api_base.rstrip('/')}/repos/{repo}"
+        self._api_base = api_base.rstrip("/")
+        self._base = f"{self._api_base}/repos/{repo}"
         self._headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
@@ -67,6 +68,25 @@ class GitHubClient:
         if not response.content:
             return None
         return response.json()
+
+    async def whoami(self) -> str | None:
+        """The login this token writes as.
+
+        Needed because the orchestrator comments with a personal access token, so its own writes
+        come back as an ordinary user with `author_association: OWNER`. Without knowing the login,
+        the trust gate whitelists the system's own escalation comments and they are forwarded to
+        Devin as human answers — an escalation loop that resets its own budget.
+        """
+        response = await request_with_retry(
+            self._client,
+            "GET",
+            f"{self._api_base}/user",
+            headers=self._headers,
+            on_retry=self._on_retry,
+        )
+        data = response.json() if response.content else {}
+        login = data.get("login")
+        return login if isinstance(login, str) else None
 
     # --- issues ------------------------------------------------------------
 

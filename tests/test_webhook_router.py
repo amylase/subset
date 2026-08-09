@@ -39,8 +39,9 @@ def labeled(number: int = 42, label: str = "devin-fix") -> dict:
 def test_valid_delivery_is_accepted_and_queued(webhook_app, repo):
     response = post(webhook_app, "issues", labeled())
     assert response.status_code == 202
-    pending = repo.pending_queue()
+    pending = repo.pending_inbox()
     assert [(p["kind"], p["payload"]) for p in pending] == [("issue_labeled", {"number": 42})]
+    assert pending[0]["provenance"] == "system"
 
 
 def test_tampered_payload_is_rejected(webhook_app, repo):
@@ -57,7 +58,7 @@ def test_tampered_payload_is_rejected(webhook_app, repo):
             },
         )
     assert response.status_code == 401
-    assert repo.pending_queue() == []
+    assert repo.pending_inbox() == []
 
 
 def test_missing_signature_is_rejected(webhook_app, repo):
@@ -68,7 +69,7 @@ def test_missing_signature_is_rejected(webhook_app, repo):
             headers={"X-GitHub-Event": "issues", "X-GitHub-Delivery": "d-y"},
         )
     assert response.status_code == 401
-    assert repo.pending_queue() == []
+    assert repo.pending_inbox() == []
 
 
 def test_redelivery_with_the_same_guid_queues_only_once(webhook_app, repo):
@@ -82,21 +83,21 @@ def test_redelivery_with_the_same_guid_queues_only_once(webhook_app, repo):
 
     assert first.status_code == 202
     assert second.status_code == 200
-    assert len(repo.pending_queue()) == 1
+    assert len(repo.pending_inbox()) == 1
     assert repo.counters().get("webhook_duplicates") == 1
 
 
 def test_a_different_label_does_not_trigger(webhook_app, repo):
     response = post(webhook_app, "issues", labeled(label="documentation"))
     assert response.status_code == 202
-    assert repo.pending_queue() == []
+    assert repo.pending_inbox() == []
 
 
 def test_unlabeled_action_does_not_trigger(webhook_app, repo):
     payload = labeled()
     payload["action"] = "unlabeled"
     post(webhook_app, "issues", payload, delivery="d-unlabeled")
-    assert repo.pending_queue() == []
+    assert repo.pending_inbox() == []
 
 
 def test_another_repository_is_ignored_even_when_correctly_signed(webhook_app, repo):
@@ -104,7 +105,7 @@ def test_another_repository_is_ignored_even_when_correctly_signed(webhook_app, r
     payload["repository"]["full_name"] = "someone/else"
     response = post(webhook_app, "issues", payload, delivery="d-other")
     assert response.status_code == 202
-    assert repo.pending_queue() == []
+    assert repo.pending_inbox() == []
     assert repo.counters().get("webhook_wrong_repo") == 1
 
 
@@ -139,7 +140,7 @@ def test_the_router_verifies_the_exact_bytes_received(webhook_app, repo):
             },
         )
     assert response.status_code == 202
-    assert [p["payload"] for p in repo.pending_queue()] == [{"number": 42}]
+    assert [p["payload"] for p in repo.pending_inbox()] == [{"number": 42}]
 
 
 def test_missing_delivery_header_is_rejected(webhook_app, repo):
