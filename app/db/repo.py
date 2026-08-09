@@ -5,9 +5,9 @@ read better as SQL, and the schema is small enough that a mapping layer would co
 returns.
 
 Nothing here writes a status. Rows record observations and timestamps; ``app.core.state`` derives
-everything else. The methods that look unusual — the effects ledger, notifications keyed by reason
-class, monotonic timestamp columns — exist because v1's equivalents each had a hole; the reasons are
-on the individual methods.
+everything else. Two conventions are load-bearing and explained on the methods themselves: effects
+are recorded *after* they succeed, never reserved beforehand, and the columns that must not go
+backwards (``acus``, ``produced_at``, ``closed_at``, ``ever_blocked``) use ``MAX``/``COALESCE``.
 
 The connection is opened per call. At this scale that is cheap and it sidesteps the thread-affinity
 rules that bite when a connection is shared between the request path and the background loop.
@@ -68,87 +68,32 @@ class Repo:
         with self._conn() as conn:
             return {r["name"]: r["value"] for r in conn.execute("SELECT name, value FROM counters")}
 
-    # --- the effects ledger ------------------------------------------------
+    # --- effects already performed ------------------------------------------
 
-    def claim_effect(self, key: str, kind: str) -> bool:
-        """Reserve the right to perform an effect. ``True`` for the first caller only.
-
-        Every outward action goes claim -> act -> confirm. The claim lands before the action,
-        a crash mid-flight leaves the key held: the effect is not retried, which is the safe
-        direction when retrying means spending money or writing to GitHub twice.
-        """
+    def is_done(self, key: str) -> bool:
         with self._conn() as conn:
             return (
-                conn.execute(
-                    "INSERT OR IGNORE INTO effects (key, kind, claimed_at) VALUES (?, ?, ?)",
-                    (key, kind, now()),
-                ).rowcount
-                == 1
+                conn.execute("SELECT 1 FROM done_effects WHERE key = ?", (key,)).fetchone()
+                is not None
             )
 
-    def release_effect(self, key: str) -> None:
-        """Give the key back, for a failure that provably did nothing outward.
+    def mark_done(self, key: str, kind: str) -> None:
+        """Record an effect *after* it succeeded.
 
-        v1 had no equivalent, so a CI feedback attempt that could not name the failing checks burned
-        the key and the retry never fired once the names became available.
+        Recording after rather than before is what makes this recoverable: a failure never leaves a
+        key held, so nothing can be permanently blocked from happening again. The cost is that a
+        crash between the API call and this write repeats the effect once, which for a comment or a
+        nudge is noise rather than damage.
         """
         with self._conn() as conn:
-            conn.execute("DELETE FROM effects WHERE key = ? AND done_at IS NULL", (key,))
-
-    def confirm_effect(self, key: str) -> None:
-        with self._conn() as conn:
-            conn.execute("UPDATE effects SET done_at = ? WHERE key = ?", (now(), key))
-
-    def effects(self) -> list[dict[str, Any]]:
-        with self._conn() as conn:
-            return [dict(r) for r in conn.execute("SELECT * FROM effects ORDER BY claimed_at")]
-
-    # --- notifications (the honesty surface) -------------------------------
-
-    def open_notification(
-        self, issue_number: int, reason_class: str, *, session_id: str | None, detail: str
-    ) -> bool:
-        """Open a notification. ``True`` if one was not already open for this reason class.
-
-        Keyed by reason class rather than by issue, so a cost halt following a question escalation
-        is still reported. v1 deduped on issue state and swallowed the second, different reason —
-        leaving an issue reading "blocked on a question" while it was actually out of credits.
-        """
-        with self._conn() as conn:
-            return (
-                conn.execute(
-                    "INSERT OR IGNORE INTO notifications "
-                    "(issue_number, reason_class, session_id, detail, opened_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (issue_number, reason_class, session_id, detail[:2000], now()),
-                ).rowcount
-                == 1
+            conn.execute(
+                "INSERT OR IGNORE INTO done_effects (key, kind, at) VALUES (?, ?, ?)",
+                (key, kind, now()),
             )
 
-    def resolve_notifications(self, issue_number: int, reason_class: str | None = None) -> int:
-        sql = (
-            "UPDATE notifications SET resolved_at = ?"
-            " WHERE issue_number = ? AND resolved_at IS NULL"
-        )
-        args: tuple[Any, ...] = (now(), issue_number)
-        if reason_class is not None:
-            sql += " AND reason_class = ?"
-            args += (reason_class,)
+    def done_effects(self) -> list[dict[str, Any]]:
         with self._conn() as conn:
-            return conn.execute(sql, args).rowcount
-
-    def open_notifications(self, issue_number: int | None = None) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM notifications WHERE resolved_at IS NULL"
-        args: tuple[Any, ...] = ()
-        if issue_number is not None:
-            sql += " AND issue_number = ?"
-            args = (issue_number,)
-        with self._conn() as conn:
-            return [dict(r) for r in conn.execute(sql + " ORDER BY opened_at", args)]
-
-    def notifications(self) -> list[dict[str, Any]]:
-        with self._conn() as conn:
-            return [dict(r) for r in conn.execute("SELECT * FROM notifications ORDER BY opened_at")]
+            return [dict(r) for r in conn.execute("SELECT * FROM done_effects ORDER BY at")]
 
     # --- deliveries and inbox ----------------------------------------------
 
@@ -164,11 +109,11 @@ class Repo:
                 == 1
             )
 
-    def enqueue(self, kind: str, payload: dict[str, Any], *, provenance: str) -> int:
+    def enqueue(self, kind: str, payload: dict[str, Any]) -> int:
         with self._conn() as conn:
             cur = conn.execute(
-                "INSERT INTO inbox (kind, payload, provenance, created_at) VALUES (?, ?, ?, ?)",
-                (kind, json.dumps(payload), provenance, now()),
+                "INSERT INTO inbox (kind, payload, created_at) VALUES (?, ?, ?)",
+                (kind, json.dumps(payload), now()),
             )
             return int(cur.lastrowid or 0)
 
@@ -217,6 +162,52 @@ class Repo:
                     "INSERT OR IGNORE INTO issues "
                     "(number, title, klass, first_labeled_at, updated_at) VALUES (?, ?, ?, ?, ?)",
                     (number, title, klass, ts, ts),
+                ).rowcount
+                == 1
+            )
+
+    def begin_attempt(self, number: int) -> int:
+        """Reserve the next attempt number, before anything billable happens.
+
+        Incrementing first means a failure mid-call can never produce a second session for the same
+        attempt, and `last_attempt_at` lets a later retry be recognised even when the call left no
+        session row behind.
+        """
+        ts = now()
+        with self._conn() as conn:
+            row = conn.execute(
+                "UPDATE issues SET attempts = attempts + 1, last_attempt_at = ?, updated_at = ? "
+                "WHERE number = ? RETURNING attempts",
+                (ts, ts, number),
+            ).fetchone()
+            return int(row["attempts"]) if row else 0
+
+    def flag_for_human(self, number: int, reason: str) -> bool:
+        """Ask for a human. True the first time a given reason applies, so it is said once.
+
+        One flag and one reason is the whole escalation surface. A different reason overwrites the
+        first rather than opening a parallel record: an operator needs to know that attention is
+        required and what is blocking it *now*.
+        """
+        ts = now()
+        with self._conn() as conn:
+            return (
+                conn.execute(
+                    "UPDATE issues SET needs_human_at = COALESCE(needs_human_at, ?),"
+                    " needs_human_reason = ?, updated_at = ?"
+                    " WHERE number = ? AND COALESCE(needs_human_reason, '') != ?",
+                    (ts, reason, ts, number, reason),
+                ).rowcount
+                == 1
+            )
+
+    def clear_human_flag(self, number: int) -> bool:
+        with self._conn() as conn:
+            return (
+                conn.execute(
+                    "UPDATE issues SET needs_human_at = NULL, needs_human_reason = NULL,"
+                    " updated_at = ? WHERE number = ? AND needs_human_at IS NOT NULL",
+                    (now(), number),
                 ).rowcount
                 == 1
             )
@@ -356,7 +347,8 @@ class Repo:
         with self._conn() as conn:
             conn.execute("UPDATE sessions SET nudges = 0 WHERE session_id = ?", (session_id,))
             conn.execute(
-                "UPDATE pull_requests SET ci_rounds = 0 WHERE session_id = ?", (session_id,)
+                "UPDATE pull_requests SET ci_rounds = 0, ci_last_sha = NULL WHERE session_id = ?",
+                (session_id,),
             )
 
     def apply_insight(
@@ -464,7 +456,14 @@ class Repo:
             )
 
     def update_pr(self, pr_number: int, **fields: Any) -> None:
-        allowed = {"merged_at", "closed_at", "ci_settled_at", "ci_conclusion", "ci_rounds"}
+        allowed = {
+            "merged_at",
+            "closed_at",
+            "ci_settled_at",
+            "ci_conclusion",
+            "ci_rounds",
+            "ci_last_sha",
+        }
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"not updatable: {sorted(unknown)}")

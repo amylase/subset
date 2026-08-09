@@ -26,7 +26,7 @@ PR_URL = "https://github.com/amylase/superset/pull/10"
 def label(orc_tuple, number: int, *, klass: str = "class:logic-bug"):
     _, repo, _, github = orc_tuple
     github.add_issue(number, labels=[TRIGGER, klass])
-    repo.enqueue("issue_labeled", {"number": number}, provenance="system")
+    repo.enqueue("issue_labeled", {"number": number})
 
 
 def status_of(orchestrator: Orchestrator, number: int) -> IssueStatus:
@@ -186,15 +186,25 @@ async def test_a_failed_start_holds_the_issue_and_says_why(orc):
     assert len([b for _, b in github.comments if "start_failed" in b]) == 1
 
 
-async def test_a_rejected_start_can_be_retried(orc):
-    """A 4xx means nothing was created and nothing billed, so the ledger key is released."""
-    orchestrator, _, devin, _ = orc
+async def test_a_rejected_start_is_flagged_and_not_retried_in_a_loop(orc, clock):
+    """A rejected request is not retried automatically.
+
+    Retrying on a timer turned a permanently-invalid request into thousands of rejected calls a
+    day. The attempt is recorded, a human is told, and re-applying the label is what tries again.
+    """
+    orchestrator, repo, devin, github = orc
     label(orc, 2)
     devin.create_error = ApiError(422, "bad field")
-    await orchestrator.tick()
+
+    for _ in range(5):
+        await orchestrator.tick()
     assert devin.created == []
+    assert repo.issue(2)["attempts"] == 1
+    assert len([b for _, b in github.comments if "start_failed" in b]) == 1
 
     devin.create_error = None
+    clock.advance(60)
+    repo.enqueue("issue_labeled", {"number": 2})
     await orchestrator.tick()
     assert len(devin.created) == 1
 
@@ -205,7 +215,7 @@ async def test_a_rejected_start_can_be_retried(orc):
 async def test_a_delabelled_issue_never_spends(orc):
     orchestrator, repo, devin, github = orc
     github.add_issue(9, labels=["documentation"])
-    repo.enqueue("issue_labeled", {"number": 9}, provenance="system")
+    repo.enqueue("issue_labeled", {"number": 9})
     await orchestrator.tick()
     assert devin.created == []
     assert repo.counters()["stale_events_ignored"] == 1
@@ -214,7 +224,7 @@ async def test_a_delabelled_issue_never_spends(orc):
 async def test_a_closed_issue_never_spends(orc):
     orchestrator, repo, devin, github = orc
     github.add_issue(9, labels=[TRIGGER], state="closed")
-    repo.enqueue("issue_labeled", {"number": 9}, provenance="system")
+    repo.enqueue("issue_labeled", {"number": 9})
     await orchestrator.tick()
     assert devin.created == []
 
@@ -222,7 +232,7 @@ async def test_a_closed_issue_never_spends(orc):
 # --- blocked sessions --------------------------------------------------------
 
 
-async def test_a_blocked_session_is_nudged_then_escalated_once(orc):
+async def test_a_blocked_session_is_nudged_then_escalated_once(orc, clock):
     orchestrator, repo, devin, github = orc
     label(orc, 2)
     await orchestrator.tick()
@@ -237,6 +247,7 @@ async def test_a_blocked_session_is_nudged_then_escalated_once(orc):
     }
 
     for _ in range(6):
+        clock.advance(200)
         await orchestrator.tick()
 
     assert repo.session(session_id)["nudges"] == 2
@@ -247,24 +258,27 @@ async def test_a_blocked_session_is_nudged_then_escalated_once(orc):
     assert len([entry for entry in github.labels_added if entry[1] == "needs-human"]) == 1
 
 
-async def test_a_second_different_reason_is_reported(orc):
-    """v1 deduped escalations on issue state, so an issue that ran out of credits after a question
-    still read 'blocked on a question'."""
-    orchestrator, repo, devin, _ = orc
+async def test_a_second_different_reason_is_reported(orc, clock):
+    """A different reason replaces the first and is announced.
+
+    "Blocked on a question" and "out of credits" call for different actions, so an operator has to
+    see the one that applies now rather than the one that applied first.
+    """
+    orchestrator, repo, devin, github = orc
     label(orc, 2)
     await orchestrator.tick()
     session_id = devin.created[0]["session_id"]
     devin.script(session_id, devin.state("running", "waiting_for_user"))
     for _ in range(4):
+        clock.advance(200)
         await orchestrator.tick()
 
     devin.script(session_id, devin.state("suspended", "out_of_credits"))
     await orchestrator.tick()
 
-    assert {n["reason_class"] for n in repo.open_notifications(2)} == {
-        "blocked_on_question",
-        "cost_halt",
-    }
+    assert repo.issue(2)["needs_human_reason"] == "cost_halt"
+    assert [b for _, b in github.comments if "blocked_on_question" in b]
+    assert [b for _, b in github.comments if "cost_halt" in b]
 
 
 async def test_a_completed_session_reports_even_if_it_looked_blocked(orc):
@@ -385,7 +399,7 @@ async def test_a_ci_failure_arriving_by_webhook_reaches_the_session(orc):
     orchestrator, repo, devin, github = orc
     session_id = await _with_open_pr(orc)
     github.failed_checks["sha1"] = ["Python-Unit", "pre-commit"]
-    repo.enqueue("ci_failed", {"pr_number": 10, "sha": "sha1"}, provenance="system")
+    repo.enqueue("ci_failed", {"pr_number": 10, "sha": "sha1"})
 
     await orchestrator.tick()
 
@@ -399,7 +413,7 @@ async def test_a_pr_closed_event_settles_the_outcome(orc):
     orchestrator, repo, _, github = orc
     await _with_open_pr(orc)
     github.add_pull(10, state="closed")
-    repo.enqueue("pr_closed", {"pr_number": 10, "merged": False}, provenance="system")
+    repo.enqueue("pr_closed", {"pr_number": 10, "merged": False})
 
     await orchestrator.tick()
 
@@ -412,7 +426,7 @@ async def test_the_webhook_and_the_poll_cannot_double_report_one_commit(orc):
     await _with_open_pr(orc)
     github.checks["sha1"] = (True, "failure")
     github.failed_checks["sha1"] = ["Python-Unit"]
-    repo.enqueue("ci_failed", {"pr_number": 10, "sha": "sha1"}, provenance="system")
+    repo.enqueue("ci_failed", {"pr_number": 10, "sha": "sha1"})
 
     for _ in range(4):
         await orchestrator.tick(pr_every=1)
@@ -450,33 +464,33 @@ async def test_a_new_commit_gets_a_new_round_then_escalates(orc):
 # --- human replies -----------------------------------------------------------
 
 
-async def _escalated(orc):
+async def _escalated(orc, clock):
     orchestrator, repo, devin, _ = orc
     label(orc, 2)
     await orchestrator.tick()
     session_id = devin.created[0]["session_id"]
     devin.script(session_id, devin.state("running", "waiting_for_user"))
     for _ in range(4):
+        clock.advance(200)
         await orchestrator.tick()
-    assert repo.open_notifications(2)
+    assert repo.issue(2)["needs_human_at"] is not None
     return session_id
 
 
-async def test_a_human_reply_resumes_and_does_not_re_escalate(orc):
+async def test_a_human_reply_resumes_and_does_not_re_escalate(orc, clock):
     orchestrator, repo, devin, github = orc
-    session_id = await _escalated(orc)
+    session_id = await _escalated(orc, clock)
     orchestrator.settings.message_grace_seconds = 300.0
 
     repo.enqueue(
         "issue_comment",
         {"issue_number": 2, "author": "amylase", "comment": "go ahead", "comment_id": 11},
-        provenance="trusted",
     )
     await orchestrator.tick()
 
     assert [m for _, m in devin.messages if "go ahead" in m]
     assert repo.session(session_id)["nudges"] == 0
-    assert repo.open_notifications(2) == []
+    assert repo.issue(2)["needs_human_at"] is None
     assert (2, "needs-human") in github.labels_removed
 
     for _ in range(3):
@@ -484,16 +498,15 @@ async def test_a_human_reply_resumes_and_does_not_re_escalate(orc):
     assert len([b for _, b in github.comments if "blocked_on_question" in b]) == 1
 
 
-async def test_a_second_reply_is_also_delivered(orc):
+async def test_a_second_reply_is_also_delivered(orc, clock):
     """Keyed on the comment id, so delivery does not depend on a state the first reply changed.
     v1 dropped every reply after the first, silently."""
     orchestrator, repo, devin, _ = orc
-    await _escalated(orc)
+    await _escalated(orc, clock)
     for comment_id, text in ((11, "first answer"), (12, "second answer")):
         repo.enqueue(
             "issue_comment",
             {"issue_number": 2, "author": "a", "comment": text, "comment_id": comment_id},
-            provenance="trusted",
         )
     await orchestrator.tick()
 
@@ -501,22 +514,21 @@ async def test_a_second_reply_is_also_delivered(orc):
     assert [m for _, m in devin.messages if "second answer" in m]
 
 
-async def test_a_replayed_comment_is_delivered_once(orc):
+async def test_a_replayed_comment_is_delivered_once(orc, clock):
     orchestrator, repo, devin, _ = orc
-    await _escalated(orc)
+    await _escalated(orc, clock)
     for _ in range(3):
         repo.enqueue(
             "issue_comment",
             {"issue_number": 2, "author": "a", "comment": "ship it", "comment_id": 11},
-            provenance="trusted",
         )
     await orchestrator.tick()
     assert len([m for _, m in devin.messages if "ship it" in m]) == 1
 
 
-async def test_forwarded_text_is_fenced_as_data(orc):
+async def test_forwarded_text_is_fenced_as_data(orc, clock):
     orchestrator, repo, devin, _ = orc
-    await _escalated(orc)
+    await _escalated(orc, clock)
     repo.enqueue(
         "issue_comment",
         {
@@ -525,7 +537,6 @@ async def test_forwarded_text_is_fenced_as_data(orc):
             "comment": "prefer the narrower diff",
             "comment_id": 11,
         },
-        provenance="trusted",
     )
     await orchestrator.tick()
     forwarded = next(m for _, m in devin.messages if "narrower diff" in m)
@@ -535,7 +546,7 @@ async def test_forwarded_text_is_fenced_as_data(orc):
 # --- retries and recovery ----------------------------------------------------
 
 
-async def test_re_labelling_starts_a_fresh_attempt(orc):
+async def test_re_labelling_starts_a_fresh_attempt(orc, clock):
     orchestrator, repo, devin, _ = orc
     label(orc, 2)
     await orchestrator.tick()
@@ -543,41 +554,43 @@ async def test_re_labelling_starts_a_fresh_attempt(orc):
     await orchestrator.tick()
     assert status_of(orchestrator, 2) is IssueStatus.AWAITING_HUMAN
 
-    repo.enqueue("issue_labeled", {"number": 2}, provenance="system")
+    clock.advance(60)
+    repo.enqueue("issue_labeled", {"number": 2})
     await orchestrator.tick()
     assert len(devin.created) == 2
     assert repo.sessions(2)[-1]["attempt"] == 2
 
 
-async def test_re_labelling_works_while_a_session_sleeps(orc):
+async def test_re_labelling_works_while_a_session_sleeps(orc, clock):
     """The commonest escalation shape: blocked, escalated, then decayed to sleep. v1 parked the
     issue in a state nothing acted on."""
     orchestrator, repo, devin, _ = orc
-    session_id = await _escalated(orc)
+    session_id = await _escalated(orc, clock)
     devin.script(session_id, devin.state("suspended", "inactivity"))
     await orchestrator.tick()
 
-    repo.enqueue("issue_labeled", {"number": 2}, provenance="system")
+    clock.advance(60)
+    repo.enqueue("issue_labeled", {"number": 2})
     await orchestrator.tick()
     assert len(devin.created) == 2
 
 
-async def test_a_poison_inbox_item_is_retried_then_reported(orc):
+async def test_a_poison_inbox_item_is_retried_then_abandoned(orc, clock):
     orchestrator, repo, devin, github = orc
-    await _escalated(orc)
+    await _escalated(orc, clock)
     devin.message_error = RuntimeError("devin unavailable")
     repo.enqueue(
         "issue_comment",
         {"issue_number": 2, "author": "a", "comment": "hi", "comment_id": 11},
-        provenance="trusted",
     )
 
     await orchestrator.tick()
+    assert repo.pending_inbox(), "a failed item must stay pending, not be marked dispatched"
 
-    # An ambiguous send may already have landed, so it is never retried — it is reported instead.
+    for _ in range(3):
+        await orchestrator.tick()
     assert not repo.pending_inbox()
     assert repo.counters()["inbox_abandoned"] == 1
-    assert [b for _, b in github.comments if "undeliverable_message" in b]
 
 
 async def test_resync_recovers_an_issue_no_webhook_delivered(orc):

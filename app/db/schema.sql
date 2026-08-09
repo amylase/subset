@@ -1,10 +1,13 @@
 -- Facts, not state.
 --
--- No table here stores a status. Rows record what was observed and when; every status is a pure
--- function of those rows (see `app/core/state.py`). v1 stored `issues.state`, wrote it from seven
--- call sites, and had the metrics and the dashboard each recompute parts of it differently — which
--- produced a session error overwriting a merged outcome, two dashboard panels disagreeing about the
--- same issue, and an escalation guard that collapsed whenever another path reset the column.
+-- Rows record what was observed and when; every status is a pure function of those rows
+-- (`app/core/state.py::issue_status`). Nothing stores a status, so nothing can disagree with it.
+--
+-- **Scope.** This system is watched by a human for the length of a demo, not run unattended for
+-- months. Effects are recorded *after* they succeed, so a crash between an API call and its record
+-- can repeat that effect once. That is a deliberate trade: the exactly-once machinery this replaced
+-- derived its keys from mutable counters and could wedge an issue permanently, which is a far worse
+-- failure than a duplicate comment. See the limitations section of the README.
 --
 -- `issues.first_labeled_at` is the one irreplaceable value: it is the MTTR origin and cannot be
 -- recovered from any external API after the fact.
@@ -16,9 +19,18 @@ CREATE TABLE IF NOT EXISTS issues (
     title              TEXT,
     klass              TEXT,           -- class:* label, for the variety breakdown
     first_labeled_at   REAL NOT NULL,  -- MTTR origin; never rewritten
-    -- Set when an operator re-applies the trigger label. "Try again" is then one fact rather than a
+    -- Set when an operator re-applies the trigger label. "Try again" is one fact rather than a
     -- state machine that has to be nudged into the right place.
     retry_requested_at REAL,
+    -- Incremented *before* the billable call, so a failure mid-flight can never lead to a second
+    -- session for the same attempt. `last_attempt_at` lets a retry be recognised even when the
+    -- call failed and left no session row.
+    attempts           INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at    REAL,
+    -- The whole escalation surface: one flag and one reason. Set when the loop gives up on making
+    -- progress alone, cleared when a human answers or the pull request merges.
+    needs_human_at     REAL,
+    needs_human_reason TEXT,
     updated_at         REAL NOT NULL
 );
 
@@ -35,16 +47,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     acus              REAL NOT NULL DEFAULT 0,
     nudges            INTEGER NOT NULL DEFAULT 0,
     ever_blocked      INTEGER NOT NULL DEFAULT 0,  -- sticky: waiting_for_user decays into sleep
-    last_message_at   REAL,       -- grace anchor: stamped by Effects on every outbound message
-    -- Two independent facts. v1 collapsed them into one column, so a session that opened a pull
-    -- request and went to sleep counted as ended and its review-fix messages were silently dropped,
-    -- while a session that finished whilst blocked could never report at all.
+    last_message_at   REAL,       -- grace anchor, stamped on every outbound message
+    -- Two independent facts. Collapsing them meant a session that opened a pull request and went to
+    -- sleep counted as ended and its review-fix messages were dropped, while a session that
+    -- finished whilst blocked could never report at all.
     produced_at       REAL,       -- delivered its work product; still wakeable
     closed_at         REAL,       -- cannot be revived by any message
     closed_reason     TEXT,
     structured_output TEXT,
-    -- From the Analytics endpoint; nothing else supplies these.
-    devin_messages    INTEGER,
+    devin_messages    INTEGER,    -- from the Analytics endpoint; nothing else supplies these
     user_messages     INTEGER,
     session_size      TEXT,
     FOREIGN KEY (issue_number) REFERENCES issues (number)
@@ -68,35 +79,19 @@ CREATE TABLE IF NOT EXISTS pull_requests (
     ci_settled_at REAL,          -- all checks complete: splits CI wait from human review wait
     ci_conclusion TEXT,
     ci_rounds     INTEGER NOT NULL DEFAULT 0,
+    ci_last_sha   TEXT,          -- the commit the last round of feedback was sent for
     merged_at     REAL,
     closed_at     REAL
 );
 
--- Open notifications are what `awaiting human` is derived from, and they are the honesty surface:
--- every bound, stall and failure opens one. Keyed by reason class, so a cost halt after a question
--- escalation is reported rather than swallowed — v1 deduped on issue state and lost the second,
--- different reason.
-CREATE TABLE IF NOT EXISTS notifications (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    issue_number INTEGER NOT NULL,
-    reason_class TEXT NOT NULL,
-    session_id   TEXT,
-    detail       TEXT,
-    opened_at    REAL NOT NULL,
-    resolved_at  REAL
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_open
-    ON notifications (issue_number, reason_class) WHERE resolved_at IS NULL;
-
--- The idempotency ledger. Every outward action claims a natural key here before it happens and
--- confirms afterwards; a failure that provably did nothing releases the key. v1 invented a separate
--- guard per effect and each one had a hole.
-CREATE TABLE IF NOT EXISTS effects (
-    key        TEXT PRIMARY KEY,
-    kind       TEXT NOT NULL,
-    claimed_at REAL NOT NULL,
-    done_at    REAL
+-- Effects already performed, recorded after the fact. Keys are built from immutable identifiers
+-- only — a comment id, a commit sha, a session id — never from a counter another path can reset.
+-- That was the flaw in the version this replaced: a reset counter regenerated a key that was
+-- already taken, and the effect could then never happen again.
+CREATE TABLE IF NOT EXISTS done_effects (
+    key  TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    at   REAL NOT NULL
 );
 
 -- Intent recorded by the receiver, drained by the loop. Rows are kept after dispatch: they are the
@@ -105,7 +100,6 @@ CREATE TABLE IF NOT EXISTS inbox (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     kind          TEXT NOT NULL,
     payload       TEXT NOT NULL,   -- json
-    provenance    TEXT NOT NULL,   -- assigned at ingest, never re-derived
     created_at    REAL NOT NULL,
     dispatched_at REAL,
     attempts      INTEGER NOT NULL DEFAULT 0,
@@ -113,7 +107,7 @@ CREATE TABLE IF NOT EXISTS inbox (
 );
 
 -- Webhook delivery GUIDs. GitHub sends no timestamp header, so this is the only replay defence
--- available; note the GUID is outside the signed body (see the limitations in the README).
+-- available; note the GUID is outside the signed body (see the README's limitations).
 CREATE TABLE IF NOT EXISTS deliveries (
     delivery_id TEXT PRIMARY KEY,
     event       TEXT NOT NULL,
@@ -140,4 +134,3 @@ CREATE INDEX IF NOT EXISTS idx_inbox_pending ON inbox (dispatched_at, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_issue ON sessions (issue_number);
 CREATE INDEX IF NOT EXISTS idx_events_session ON session_events (session_id);
 CREATE INDEX IF NOT EXISTS idx_pr_issue ON pull_requests (issue_number);
-CREATE INDEX IF NOT EXISTS idx_notifications_issue ON notifications (issue_number);

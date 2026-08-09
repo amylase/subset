@@ -41,7 +41,6 @@ def test_valid_delivery_is_accepted_and_queued(webhook_app, repo):
     assert response.status_code == 202
     pending = repo.pending_inbox()
     assert [(p["kind"], p["payload"]) for p in pending] == [("issue_labeled", {"number": 42})]
-    assert pending[0]["provenance"] == "system"
 
 
 def test_tampered_payload_is_rejected(webhook_app, repo):

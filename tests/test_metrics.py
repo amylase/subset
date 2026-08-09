@@ -14,13 +14,12 @@ from app.core.state import IssueStatus
 HOUR = 3600.0
 
 
-def make(view=None, sessions=None, pulls=None, interventions=None, notifications=None):
+def make(view=None, sessions=None, pulls=None, interventions=None):
     return compute(
         view=view or [],
         sessions=sessions or [],
         pull_requests=pulls or [],
         interventions=interventions or [],
-        notifications=notifications or [],
         counters={},
         acu_unit_cost_usd=2.0,
         manual_effort_hours_per_issue=4.0,
@@ -28,7 +27,7 @@ def make(view=None, sessions=None, pulls=None, interventions=None, notifications
     )
 
 
-def row(number: int, status=IssueStatus.MERGED, *, labeled_at=0.0, klass=None, attempts=1):
+def row(number, status=IssueStatus.MERGED, *, labeled_at=0.0, klass=None, attempts=1, waiting=None):
     return {
         "number": number,
         "title": f"issue {number}",
@@ -36,6 +35,8 @@ def row(number: int, status=IssueStatus.MERGED, *, labeled_at=0.0, klass=None, a
         "first_labeled_at": labeled_at,
         "status": status,
         "attempts": attempts,
+        "needs_human_at": 5.0 if waiting else None,
+        "needs_human_reason": waiting,
     }
 
 
@@ -150,17 +151,16 @@ def test_ci_first_pass_rate_excludes_pull_requests_that_needed_the_fix_loop():
     assert m.ci_first_pass_rate == 0.5
 
 
-def test_open_notifications_are_surfaced():
+def test_issues_waiting_on_a_human_are_surfaced():
     """The honesty surface: a system that has stopped working must say so on the dashboard."""
     m = make(
-        view=[row(1, IssueStatus.AWAITING_HUMAN)],
-        notifications=[
-            {"issue_number": 1, "reason_class": "cost_halt", "resolved_at": None},
-            {"issue_number": 1, "reason_class": "blocked_on_question", "resolved_at": 5.0},
-        ],
+        view=[
+            row(1, IssueStatus.AWAITING_HUMAN, waiting="cost_halt"),
+            row(2, IssueStatus.PR_OPEN),
+        ]
     )
-    assert [n["reason_class"] for n in m.open_notifications] == ["cost_halt"]
-    assert m.notifications_by_reason == {"cost_halt": 1, "blocked_on_question": 1}
+    assert [n["reason"] for n in m.waiting_on_human] == ["cost_halt"]
+    assert m.waiting_by_reason == {"cost_halt": 1}
 
 
 def test_status_counts_come_from_the_derived_view():

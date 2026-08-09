@@ -158,13 +158,13 @@
     </table>
   </div>
 
-  {% if m.open_notifications %}
+  {% if m.waiting_on_human %}
   <h2>Waiting on a human</h2>
   <div class="panel">
-    {% for n in m.open_notifications %}
-      <div class="note"><b>{{ n.reason_class | replace("_", " ") }}</b> ·
+    {% for n in m.waiting_on_human %}
+      <div class="note"><b>{{ n.reason | replace("_", " ") }}</b> ·
         <a href="https://github.com/{{ repo }}/issues/{{ n.issue_number }}">#{{ n.issue_number }}</a>
-        — {{ n.detail | truncate(160) }}</div>
+        — {{ n.title | truncate(120) }}</div>
     {% endfor %}
   </div>
   {% endif %}
@@ -176,7 +176,7 @@
       <div class="kv">
         {% for k, v in m.session_outcomes.items() %}<div><span>session · {{ k }}</span><span>{{ v }}</span></div>{% endfor %}
         {% for k, v in m.interventions_by_kind.items() %}<div><span>intervention · {{ k }}</span><span>{{ v }}</span></div>{% endfor %}
-        {% for k, v in m.notifications_by_reason.items() %}<div><span>notified · {{ k | replace('_',' ') }}</span><span>{{ v }}</span></div>{% endfor %}
+        {% for k, v in m.waiting_by_reason.items() %}<div><span>waiting · {{ k | replace('_',' ') }}</span><span>{{ v }}</span></div>{% endfor %}
         {% for k, v in m.counters.items() %}<div><span>{{ k | replace("_", " ") }}</span><span>{{ "%g"|format(v) }}</span></div>{% endfor %}
         <div><span>CI first-pass rate</span><span>{{ m.ci_first_pass_rate | pct }}</span></div>
         <div><span>Devin turns per resolution</span><span>{% if m.devin_turns_per_resolution is not none %}{{ "%.0f"|format(m.devin_turns_per_resolution) }}{% else %}—{% endif %}</span></div>

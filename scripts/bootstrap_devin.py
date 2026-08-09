@@ -28,7 +28,7 @@ from app.clients.devin import DevinClient, collection_items
 from app.config import get_settings
 from app.core.prompts import PLAYBOOK_BODY, PLAYBOOK_TITLE, SCAN_SCHEDULE_PROMPT
 
-WEEKLY_MONDAY_09_00 = "0 9 * * 1"
+WEEKLY = "weekly"
 
 
 async def main(create_schedule: bool) -> int:
@@ -48,18 +48,18 @@ async def main(create_schedule: bool) -> int:
             print("skipping schedule (pass --schedule to create the weekly audit)")
             return 0
 
-        schedule_title = f"Weekly audit: {settings.github_repo}"
-        existing = {s.get("title") for s in collection_items(await devin.list_schedules())}
-        if schedule_title in existing:
-            print(f"schedule already registered: {schedule_title}")
+        schedule_name = f"Weekly audit: {settings.github_repo}"
+        # The list response names schedules `name`, not `title` — reading the wrong key made the
+        # dedupe never fire, so every run added another weekly ACU spend.
+        existing = {s.get("name") for s in collection_items(await devin.list_schedules())}
+        if schedule_name in existing:
+            print(f"schedule already registered: {schedule_name}")
         else:
             prompt = (
                 f"Repository: https://github.com/{settings.github_repo}\n\n{SCAN_SCHEDULE_PROMPT}"
             )
-            created = await devin.create_schedule(
-                prompt, WEEKLY_MONDAY_09_00, timezone="UTC", title=schedule_title
-            )
-            print(f"schedule created: {created.get('schedule_id') or created.get('id')}")
+            created = await devin.create_schedule(schedule_name, prompt, WEEKLY)
+            print(f"schedule created: {created.get('scheduled_session_id') or created}")
     finally:
         await devin.aclose()
     return 0

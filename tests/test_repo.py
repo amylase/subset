@@ -13,51 +13,50 @@ def seed(repo: Repo, number: int = 2) -> None:
 # --- the effects ledger ------------------------------------------------------
 
 
-def test_a_key_can_be_claimed_once(repo: Repo):
-    assert repo.claim_effect("k", "comment") is True
-    assert repo.claim_effect("k", "comment") is False
+def test_an_effect_is_recorded_after_it_happens(repo: Repo):
+    assert repo.is_done("k") is False
+    repo.mark_done("k", "comment")
+    assert repo.is_done("k") is True
 
 
-def test_a_released_key_can_be_claimed_again(repo: Repo):
-    """v1 had no release, so a CI feedback attempt that could not name the failing checks burned
-    the key and the retry never fired once the names appeared."""
-    repo.claim_effect("k", "message")
-    repo.release_effect("k")
-    assert repo.claim_effect("k", "message") is True
-
-
-def test_a_confirmed_key_cannot_be_released(repo: Repo):
-    repo.claim_effect("k", "message")
-    repo.confirm_effect("k")
-    repo.release_effect("k")
-    assert repo.claim_effect("k", "message") is False
+def test_recording_the_same_effect_twice_is_harmless(repo: Repo):
+    repo.mark_done("k", "comment")
+    repo.mark_done("k", "comment")
+    assert len(repo.done_effects()) == 1
 
 
 # --- notifications -----------------------------------------------------------
 
 
-def test_one_open_notification_per_reason_class(repo: Repo):
+def test_the_same_reason_is_flagged_once(repo: Repo):
     seed(repo)
-    assert repo.open_notification(2, "blocked", session_id=None, detail="d") is True
-    assert repo.open_notification(2, "blocked", session_id=None, detail="d") is False
-    assert repo.open_notification(2, "cost_halt", session_id=None, detail="d") is True
-    assert {n["reason_class"] for n in repo.open_notifications(2)} == {"blocked", "cost_halt"}
+    assert repo.flag_for_human(2, "blocked") is True
+    assert repo.flag_for_human(2, "blocked") is False
 
 
-def test_a_resolved_reason_can_recur(repo: Repo):
+def test_a_different_reason_replaces_the_first(repo: Repo):
+    """An operator needs the reason that applies now, not the one that applied first."""
     seed(repo)
-    repo.open_notification(2, "blocked", session_id=None, detail="d")
-    repo.resolve_notifications(2, "blocked")
-    assert repo.open_notifications(2) == []
-    assert repo.open_notification(2, "blocked", session_id=None, detail="again") is True
+    repo.flag_for_human(2, "blocked")
+    assert repo.flag_for_human(2, "cost_halt") is True
+    assert repo.issue(2)["needs_human_reason"] == "cost_halt"
 
 
-def test_resolving_without_a_class_closes_them_all(repo: Repo):
+def test_a_cleared_flag_can_be_raised_again(repo: Repo):
     seed(repo)
-    repo.open_notification(2, "a", session_id=None, detail="")
-    repo.open_notification(2, "b", session_id=None, detail="")
-    assert repo.resolve_notifications(2) == 2
-    assert repo.open_notifications(2) == []
+    repo.flag_for_human(2, "blocked")
+    assert repo.clear_human_flag(2) is True
+    assert repo.issue(2)["needs_human_at"] is None
+    assert repo.flag_for_human(2, "blocked") is True
+
+
+def test_an_attempt_is_reserved_before_anything_is_spent(repo: Repo):
+    """The number advances even when the call that follows it fails, so a retry is
+    recognisable and the same attempt can never be billed twice."""
+    seed(repo)
+    assert repo.begin_attempt(2) == 1
+    assert repo.begin_attempt(2) == 2
+    assert repo.issue(2)["last_attempt_at"] is not None
 
 
 # --- issues ------------------------------------------------------------------
@@ -140,16 +139,17 @@ def test_structured_output_is_not_erased_by_a_later_poll(repo: Repo):
     assert '"outcome": "fixed"' in repo.session("s1")["structured_output"]
 
 
-def test_resetting_budgets_clears_nudges_and_ci_rounds(repo: Repo):
+def test_resetting_budgets_clears_nudges_and_the_ci_round(repo: Repo):
     seed(repo)
     repo.bump_nudges("s1")
     repo.bump_nudges("s1")
     repo.upsert_pr(10, issue_number=2, session_id="s1", url="u", opened_at=1.0)
-    repo.update_pr(10, ci_rounds=3)
+    repo.update_pr(10, ci_rounds=3, ci_last_sha="abc")
 
     repo.reset_budgets("s1")
     assert repo.session("s1")["nudges"] == 0
     assert repo.pull_request(10)["ci_rounds"] == 0
+    assert repo.pull_request(10)["ci_last_sha"] is None
 
 
 def test_a_sparse_insight_row_preserves_known_values(repo: Repo):
@@ -178,17 +178,16 @@ def test_delivery_ids_are_idempotent(repo: Repo):
 
 
 def test_inbox_round_trip(repo: Repo):
-    repo.enqueue("issue_labeled", {"number": 7}, provenance="system")
+    repo.enqueue("issue_labeled", {"number": 7})
     pending = repo.pending_inbox()
     assert len(pending) == 1
     assert pending[0]["payload"] == {"number": 7}
-    assert pending[0]["provenance"] == "system"
     repo.mark_dispatched(pending[0]["id"])
     assert repo.pending_inbox() == []
 
 
 def test_inbox_failures_are_counted_then_exhausted(repo: Repo):
-    inbox_id = repo.enqueue("issue_comment", {}, provenance="trusted")
+    inbox_id = repo.enqueue("issue_comment", {})
     assert repo.record_inbox_failure(inbox_id, "boom", max_attempts=3) is False
     assert repo.record_inbox_failure(inbox_id, "boom", max_attempts=3) is False
     assert repo.record_inbox_failure(inbox_id, "boom", max_attempts=3) is True

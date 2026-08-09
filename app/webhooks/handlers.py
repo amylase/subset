@@ -1,33 +1,20 @@
-"""Turning GitHub events into orchestrator intent, with provenance attached.
+"""Turning GitHub events into orchestrator intent.
 
 A pure function, so the whole routing and trust surface is testable without a server, a database or
 a network.
 
-Provenance is assigned here and never re-derived. Everything the orchestrator later forwards to a
-Devin session reaches an agent holding a checked-out working tree and push rights on a public
-repository, so these paths are an instruction channel rather than a comment feed.
-
-The identity check comes first and matters most. The orchestrator writes to GitHub with a personal
-access token, so its own comments arrive as ``type: "User"`` with ``author_association: "OWNER"`` —
-v1's bot filter did not match them and the trust gate therefore whitelisted the system's own
-escalation comments, which were forwarded to Devin as human answers, which reset the nudge budget,
-which produced another escalation. An infinite loop on the first escalation.
+Everything the orchestrator later forwards to a Devin session reaches an agent holding a
+checked-out working tree and push rights on a public repository, so the comment paths are an
+instruction channel rather than a comment feed. :func:`may_reach_the_agent` is the gate, and it
+fails closed — including when our own identity is unknown.
 """
 
 from __future__ import annotations
 
-from enum import StrEnum
+import re
 from typing import Any
 
 from app.clients.github import FAILING_CONCLUSIONS
-
-
-class Provenance(StrEnum):
-    SELF = "self"
-    TRUSTED = "trusted"
-    UNTRUSTED = "untrusted"
-    SYSTEM = "system"
-
 
 #: Associations that imply repository trust. Note this is repository *access*: `COLLABORATOR`
 #: includes read and triage collaborators, not only those who can write.
@@ -37,20 +24,32 @@ TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 #: instruction, and it is a way to push the real task out of the agent's attention.
 MAX_FORWARDED_CHARS = 4000
 
-Intent = tuple[str, dict[str, Any], Provenance] | None
+Intent = tuple[str, dict[str, Any]] | None
 
 
-def classify(comment: dict[str, Any], *, own_login: str | None) -> Provenance:
-    """Who is speaking. Identity is checked before association."""
+def may_reach_the_agent(comment: dict[str, Any], *, own_login: str | None) -> bool:
+    """Whether this comment's text may be forwarded to a Devin session.
+
+    Fails closed. Identity is checked before association and an unknown identity is a refusal:
+    the orchestrator writes with a personal access token, so its own comments arrive as an ordinary
+    user with ``author_association: OWNER``. If we do not know which login is ours we cannot tell
+    them apart from a maintainer's, and forwarding our own escalation comment back to Devin as a
+    human answer resets the nudge budget and escalates again — indefinitely.
+    """
+    if not own_login:
+        return False
     user = comment.get("user") or {}
     login = user.get("login")
-    if own_login and login and login.lower() == own_login.lower():
-        return Provenance.SELF
+    if login and login.lower() == own_login.lower():
+        return False
     if user.get("type") == "Bot":
-        return Provenance.SELF
-    if comment.get("author_association") in TRUSTED_ASSOCIATIONS:
-        return Provenance.TRUSTED
-    return Provenance.UNTRUSTED
+        return False
+    return comment.get("author_association") in TRUSTED_ASSOCIATIONS
+
+
+def _sha(value: Any) -> str | None:
+    """Coerce a commit sha that will end up in an API path, like :func:`_number`."""
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{7,40}", value) else None
 
 
 def _number(value: Any) -> int | None:
@@ -91,30 +90,29 @@ def _issues(payload: dict[str, Any], trigger_label: str) -> Intent:
     number = _number((payload.get("issue") or {}).get("number"))
     if number is None:
         return None
-    return "issue_labeled", {"number": number}, Provenance.SYSTEM
+    return "issue_labeled", {"number": number}
 
 
 def _comment_fields(
     payload: dict[str, Any], own_login: str | None
-) -> tuple[dict[str, Any], str, int, Provenance] | None:
+) -> tuple[dict[str, Any], str, int] | None:
     if payload.get("action") != "created":
         return None
     comment = payload.get("comment") or {}
-    provenance = classify(comment, own_login=own_login)
-    if provenance is not Provenance.TRUSTED:
+    if not may_reach_the_agent(comment, own_login=own_login):
         return None
     body = (comment.get("body") or "").strip()
     comment_id = _number(comment.get("id"))
     if not body or comment_id is None:
         return None
-    return comment, body[:MAX_FORWARDED_CHARS], comment_id, provenance
+    return comment, body[:MAX_FORWARDED_CHARS], comment_id
 
 
 def _issue_comment(payload: dict[str, Any], own_login: str | None) -> Intent:
     fields = _comment_fields(payload, own_login)
     if fields is None:
         return None
-    comment, body, comment_id, provenance = fields
+    comment, body, comment_id = fields
     number = _number((payload.get("issue") or {}).get("number"))
     if number is None:
         return None
@@ -126,7 +124,6 @@ def _issue_comment(payload: dict[str, Any], own_login: str | None) -> Intent:
             "comment": body,
             "comment_id": comment_id,
         },
-        provenance,
     )
 
 
@@ -134,7 +131,7 @@ def _review_comment(payload: dict[str, Any], own_login: str | None) -> Intent:
     fields = _comment_fields(payload, own_login)
     if fields is None:
         return None
-    comment, body, comment_id, provenance = fields
+    comment, body, comment_id = fields
     number = _number((payload.get("pull_request") or {}).get("number"))
     if number is None:
         return None
@@ -146,7 +143,6 @@ def _review_comment(payload: dict[str, Any], own_login: str | None) -> Intent:
             "comment": body,
             "comment_id": comment_id,
         },
-        provenance,
     )
 
 
@@ -169,8 +165,7 @@ def _workflow_run(payload: dict[str, Any]) -> Intent:
         return None
     return (
         "ci_failed",
-        {"pr_number": number, "sha": run.get("head_sha"), "workflow": run.get("name")},
-        Provenance.SYSTEM,
+        {"pr_number": number, "sha": _sha(run.get("head_sha"))},
     )
 
 
@@ -183,7 +178,6 @@ def _pull_request(payload: dict[str, Any]) -> Intent:
     return (
         "pr_closed",
         {"pr_number": number, "merged": bool((payload["pull_request"]).get("merged"))},
-        Provenance.SYSTEM,
     )
 
 

@@ -106,9 +106,14 @@ def test_closing_reason(status, detail, expected):
 def test_a_sleeping_session_still_occupies_a_slot():
     """v1 counted only awake sessions, so blocked and sleeping ones escaped the cap entirely —
     and both resume spending the moment they are messaged."""
-    assert occupies_slot(session("suspended", "inactivity"))
-    assert occupies_slot(session("running", "waiting_for_user"))
-    assert not occupies_slot(session("exit", None))
+    assert occupies_slot(session("suspended", "inactivity"), issue_is_terminal=False)
+    assert occupies_slot(session("running", "waiting_for_user"), issue_is_terminal=False)
+    assert not occupies_slot(session("exit", None), issue_is_terminal=False)
+
+
+def test_a_merged_issue_frees_its_slot():
+    """Two merged issues whose sessions still slept would otherwise stall the pipeline."""
+    assert not occupies_slot(session("suspended", "inactivity"), issue_is_terminal=True)
 
 
 # --- produced ---------------------------------------------------------------
@@ -165,51 +170,58 @@ def test_is_blocked(detail, expected):
 
 
 def issue(**extra):
-    return {"number": 2, "first_labeled_at": 0.0, "retry_requested_at": None, **extra}
+    return {
+        "number": 2,
+        "first_labeled_at": 0.0,
+        "retry_requested_at": None,
+        "attempts": 1,
+        "last_attempt_at": 1.0,
+        "needs_human_at": None,
+        "needs_human_reason": None,
+        **extra,
+    }
 
 
 def test_merged_outranks_everything():
     status = issue_status(
-        issue(),
+        issue(needs_human_at=4.0, needs_human_reason="blocked_on_question"),
         [session("error", None, closed_at=5.0)],
         [pull(merged_at=9.0)],
-        [{"reason_class": "blocked_on_question"}],
     )
     assert status is IssueStatus.MERGED
 
 
-def test_an_open_notification_outranks_an_open_pr():
-    status = issue_status(issue(), [session()], [pull()], [{"reason_class": "ci_unresolved"}])
-    assert status is IssueStatus.AWAITING_HUMAN
+def test_a_human_flag_outranks_an_open_pr():
+    flagged = issue(needs_human_at=3.0, needs_human_reason="ci_unresolved")
+    assert issue_status(flagged, [session()], [pull()]) is IssueStatus.AWAITING_HUMAN
 
 
 def test_an_open_pr_outranks_a_running_session():
-    assert issue_status(issue(), [session()], [pull()], []) is IssueStatus.PR_OPEN
+    assert issue_status(issue(), [session()], [pull()]) is IssueStatus.PR_OPEN
 
 
 def test_a_live_session_is_in_progress():
-    assert issue_status(issue(), [session()], [], []) is IssueStatus.IN_PROGRESS
+    assert issue_status(issue(), [session()], []) is IssueStatus.IN_PROGRESS
 
 
-def test_no_session_is_queued():
-    assert issue_status(issue(), [], [], []) is IssueStatus.QUEUED
+def test_no_attempt_yet_is_queued():
+    fresh = issue(attempts=0, last_attempt_at=None)
+    assert issue_status(fresh, [], []) is IssueStatus.QUEUED
 
 
 def test_all_sessions_closed_is_exhausted():
-    status = issue_status(issue(), [session("error", None, closed_at=5.0)], [], [])
+    status = issue_status(issue(), [session("error", None, closed_at=5.0)], [])
     assert status is IssueStatus.EXHAUSTED
 
 
 def test_a_closed_pr_does_not_keep_an_issue_open():
-    status = issue_status(
-        issue(), [session("exit", None, closed_at=5.0)], [pull(closed_at=8.0)], []
-    )
+    status = issue_status(issue(), [session("exit", None, closed_at=5.0)], [pull(closed_at=8.0)])
     assert status is IssueStatus.EXHAUSTED
 
 
 def test_a_produced_session_is_not_in_progress():
     """Otherwise a session that opened a pull request and rested would read as still working."""
-    status = issue_status(issue(), [session("suspended", "inactivity", produced_at=4.0)], [], [])
+    status = issue_status(issue(), [session("suspended", "inactivity", produced_at=4.0)], [])
     assert status is IssueStatus.EXHAUSTED
 
 
@@ -221,7 +233,7 @@ def test_a_retry_after_the_newest_attempt_queues_again():
     nudged into exactly the right place and did nothing for the commonest escalation shape."""
     sessions = [session("error", None, closed_at=5.0, created_at=1.0)]
     assert wants_session(issue(retry_requested_at=9.0), sessions)
-    assert issue_status(issue(retry_requested_at=9.0), sessions, [], []) is IssueStatus.QUEUED
+    assert issue_status(issue(retry_requested_at=9.0), sessions, []) is IssueStatus.QUEUED
 
 
 def test_a_retry_works_even_while_a_session_sleeps():
@@ -231,4 +243,4 @@ def test_a_retry_works_even_while_a_session_sleeps():
 
 def test_a_stale_retry_does_not_queue_again():
     sessions = [session(created_at=20.0)]
-    assert not wants_session(issue(retry_requested_at=9.0), sessions)
+    assert not wants_session(issue(retry_requested_at=9.0, last_attempt_at=20.0), sessions)

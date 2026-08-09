@@ -75,8 +75,8 @@ class Metrics:
     attempts_per_issue: float | None = None
 
     # honesty
-    open_notifications: list[dict[str, Any]] = field(default_factory=list)
-    notifications_by_reason: dict[str, int] = field(default_factory=dict)
+    waiting_on_human: list[dict[str, Any]] = field(default_factory=list)
+    waiting_by_reason: dict[str, int] = field(default_factory=dict)
     counters: dict[str, float] = field(default_factory=dict)
     assumptions: list[str] = field(default_factory=list)
 
@@ -87,7 +87,6 @@ def compute(
     sessions: list[dict[str, Any]],
     pull_requests: list[dict[str, Any]],
     interventions: list[dict[str, Any]],
-    notifications: list[dict[str, Any]],
     counters: dict[str, float],
     acu_unit_cost_usd: float,
     manual_effort_hours_per_issue: float,
@@ -123,10 +122,15 @@ def compute(
     for item in interventions:
         m.interventions_by_kind[item["kind"]] = m.interventions_by_kind.get(item["kind"], 0) + 1
 
-    for note in notifications:
-        reason = note["reason_class"]
-        m.notifications_by_reason[reason] = m.notifications_by_reason.get(reason, 0) + 1
-    m.open_notifications = [n for n in notifications if n["resolved_at"] is None]
+    # The honesty surface, straight off the issue rows: one flag and one reason each.
+    for row in view:
+        if row.get("needs_human_at") is None:
+            continue
+        reason = row.get("needs_human_reason") or "unknown"
+        m.waiting_on_human.append(
+            {"issue_number": row["number"], "reason": reason, "title": row.get("title") or ""}
+        )
+        m.waiting_by_reason[reason] = m.waiting_by_reason.get(reason, 0) + 1
 
     # --- autonomy ----------------------------------------------------------
     # Denominated on the observed outcome — issues that produced a pull request — like every other

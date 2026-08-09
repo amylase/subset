@@ -1,27 +1,22 @@
 """The reconcile loop.
 
 Derives status from facts, decides what should change, and asks :mod:`app.core.effects` to change
-it. It performs no writes of its own — no API client is called from this module — which is what
-keeps the concurrency, ACU and message guards enforceable in one place.
+it. It performs no writes of its own, which keeps the concurrency, ACU and message guards
+enforceable in one place.
 
-Five passes run at different cadences inside a single tick:
-
-======================  ========  ==========================================================
-Pass                    Cadence   Work
-======================  ========  ==========================================================
-drain inbox             every     Act on intent the receiver recorded
-start sessions          every     Issues whose derived status is ``queued``
-track sessions          every     Poll, advance, nudge, notify, report
-track pull requests     60s       CI outcome and merge state
-resync + analytics      300s      Recover lost events; reconcile ACUs and message counts
-======================  ========  ==========================================================
+Five passes at different cadences inside a single tick: drain the inbox, start sessions, track
+sessions, track pull requests (60s), resync and refresh analytics (300s).
 
 Ticks are serialised. The admin endpoint runs ``tick()`` on the same event loop as the background
 task, and without the lock two ticks interleave at the ``await`` inside session creation — two paid
 sessions for one issue, and the concurrency cap bypassed.
 
-Resync is not redundant with webhooks: GitHub does not retry failed deliveries, so an event arriving
-while this process is down is gone for good.
+Resync is not redundant with webhooks: GitHub does not retry failed deliveries, so an event
+arriving while this process is down is gone for good.
+
+**Scope.** A human watches this run. It is allowed to fail visibly and be restarted; it does not try
+to guarantee exactly-once effects across a crash. What it does guarantee is that it never spends
+twice for one attempt and never stalls invisibly — every dead end raises a flag on the issue.
 """
 
 from __future__ import annotations
@@ -32,10 +27,10 @@ import logging
 import re
 from typing import Any
 
-from app.clients.devin import collection_items, last_devin_message
+from app.clients.devin import collection_items
 from app.config import Settings
 from app.core import prompts
-from app.core.effects import AmbiguousEffect, Effects, Reason
+from app.core.effects import Effects, Reason
 from app.core.state import (
     IssueStatus,
     Liveness,
@@ -46,7 +41,6 @@ from app.core.state import (
     issue_status,
     liveness,
     occupies_slot,
-    wants_session,
 )
 from app.db.repo import Repo, now
 
@@ -60,20 +54,16 @@ ORCHESTRATOR_TAG = "orchestrator:superset-remediation"
 
 MAX_INBOX_ATTEMPTS = 3
 
-#: Inbox kinds carrying information nothing else reconstructs. Giving up on one is worth saying.
-IRRECOVERABLE_KINDS = frozenset({"issue_comment", "review_comment"})
-
 
 def parse_pr_number(url: str | None, repo: str) -> int | None:
     """Extract a pull request number, but only for our own repository.
 
-    Anchored on purpose: a loose ``/pull/(\\d+)`` search accepted a URL for any repository and the
-    orchestrator then acted on that number against ours.
+    Anchored on purpose: a loose ``/pull/(\\d+)`` search accepts a URL for any repository, and the
+    orchestrator would then act on that number against ours.
     """
     if not url:
         return None
-    prefix = f"https://github.com/{repo}"
-    if not url.startswith(prefix):
+    if not url.startswith(f"https://github.com/{repo}"):
         return None
     match = _PR_URL.search(url)
     return int(match.group(1)) if match else None
@@ -118,19 +108,34 @@ class Orchestrator:
                 await self.resync()
                 await self.refresh_insights()
 
+    # -- the shared view ----------------------------------------------------
+
+    def contexts(self) -> list[dict[str, Any]]:
+        """Every issue with its sessions, pull requests and derived status.
+
+        The control plane and the reporting surface read the same thing. When they did not, an
+        issue could sit in a status the dashboard displayed and nothing acted on.
+        """
+        rows = []
+        for issue in self.repo.issues():
+            sessions = self.repo.sessions(issue["number"])
+            pulls = self.repo.pull_requests(issue["number"])
+            rows.append(
+                {
+                    "issue": issue,
+                    "sessions": sessions,
+                    "pulls": pulls,
+                    "status": issue_status(issue, sessions, pulls),
+                }
+            )
+        return rows
+
     # -- pass 1: recorded intent -------------------------------------------
 
     async def drain_inbox(self) -> None:
         for item in self.repo.pending_inbox():
             try:
                 await self._handle(item["kind"], item["payload"])
-            except AmbiguousEffect as exc:
-                # The effect may already have happened, so retrying is not safe. Stop and say so.
-                logger.warning("inbox item %s (%s) is ambiguous: %s", item["id"], item["kind"], exc)
-                self.repo.bump("inbox_errors")
-                self.repo.bump("inbox_abandoned")
-                self.repo.mark_dispatched(item["id"])
-                await self._report_abandoned(item, exc)
             except Exception as exc:
                 logger.exception("inbox item %s (%s) failed", item["id"], item["kind"])
                 self.repo.bump("inbox_errors")
@@ -138,7 +143,6 @@ class Orchestrator:
                     item["id"], repr(exc), max_attempts=MAX_INBOX_ATTEMPTS
                 ):
                     self.repo.bump("inbox_abandoned")
-                    await self._report_abandoned(item, exc)
             else:
                 self.repo.mark_dispatched(item["id"])
 
@@ -149,20 +153,18 @@ class Orchestrator:
             case "ci_failed":
                 await self._feed_ci_failure(payload["pr_number"], payload.get("sha"))
             case "review_comment":
-                await self._forward_comment(
-                    self.repo.pull_request(payload["pr_number"]),
-                    author=payload["author"],
-                    comment=payload["comment"],
-                    comment_id=payload["comment_id"],
-                    is_review=True,
+                await self._forward_review(
+                    payload["pr_number"],
+                    payload["author"],
+                    payload["comment"],
+                    payload["comment_id"],
                 )
             case "issue_comment":
-                await self._forward_comment(
-                    {"issue_number": payload["issue_number"]},
-                    author=payload["author"],
-                    comment=payload["comment"],
-                    comment_id=payload["comment_id"],
-                    is_review=False,
+                await self._forward_reply(
+                    payload["issue_number"],
+                    payload["author"],
+                    payload["comment"],
+                    payload["comment_id"],
                 )
             case "pr_closed":
                 record = self.repo.pull_request(payload["pr_number"])
@@ -170,25 +172,6 @@ class Orchestrator:
                     await self._advance_pull_request(record)
             case _:
                 raise ValueError(f"no handler for inbox kind: {kind}")
-
-    async def _report_abandoned(self, item: dict[str, Any], exc: Exception) -> None:
-        if item["kind"] not in IRRECOVERABLE_KINDS:
-            return
-        issue_number = item["payload"].get("issue_number")
-        if issue_number is None:
-            pr = self.repo.pull_request(item["payload"].get("pr_number", -1))
-            issue_number = pr["issue_number"] if pr else None
-        if issue_number is None:
-            return
-        await self.effects.notify(
-            issue_number,
-            reason_class=Reason.UNDELIVERABLE,
-            detail=(
-                f"A `{item['kind']}` could not be delivered to the Devin session after "
-                f"{MAX_INBOX_ATTEMPTS} attempts (`{exc!r}`). Nothing else reconstructs it, so "
-                "please repeat it once the orchestrator is healthy."
-            ),
-        )
 
     async def _register_issue(self, number: int) -> None:
         """Trust-but-verify: confirm the label is really on the issue before spending anything."""
@@ -204,58 +187,66 @@ class Orchestrator:
             logger.info("registered issue #%s (%s)", number, klass)
             return
 
-        # Already known: re-applying the label means "try again". That is one fact, and the derived
-        # status picks it up on the next pass.
+        # Already known: re-applying the label means "try again". One fact; the derived status
+        # picks it up on the next pass.
         self.repo.request_retry(number)
         self.repo.bump("retries_requested")
-        await self.effects.resolve(number)
+        await self.effects.clear_human_flag(number)
         logger.info("retry requested for issue #%s", number)
 
     # -- pass 2: start sessions --------------------------------------------
 
     async def start_sessions(self) -> None:
-        deferred_for_budget: int | None = None
-        for issue in self.repo.issues():
-            sessions = self.repo.sessions(issue["number"])
-            if not wants_session(issue, sessions):
-                continue
+        contexts = self.contexts()
+        active = sum(
+            1
+            for ctx in contexts
+            for s in ctx["sessions"]
+            if occupies_slot(s, issue_is_terminal=ctx["status"] is IssueStatus.MERGED)
+        )
+        spent = self.repo.total_acus()
 
-            active = sum(1 for s in self.repo.sessions() if occupies_slot(s))
+        for ctx in contexts:
+            if ctx["status"] is not IssueStatus.QUEUED:
+                continue
+            issue = ctx["issue"]
+
             if active >= self.settings.max_concurrent_sessions:
                 self.repo.bump("start_deferred_concurrency")
                 return
-            spent = self.repo.total_acus()
             if spent >= self.settings.global_acu_budget:
-                deferred_for_budget = issue["number"]
-                break
+                await self.effects.flag_human(
+                    issue["number"],
+                    reason=Reason.BUDGET_EXHAUSTED,
+                    detail=(
+                        f"The global ACU budget ({self.settings.global_acu_budget}) is spent, so "
+                        "no further sessions will start. Raise `GLOBAL_ACU_BUDGET` to continue."
+                    ),
+                )
+                return
 
+            active += 1
             try:
-                await self._create_session(issue, attempt=len(sessions) + 1)
+                await self._create_session(issue)
             except Exception:
                 logger.exception("starting a session for #%s failed", issue["number"])
                 self.repo.bump("session_start_errors")
-                await self.effects.notify(
+                await self.effects.flag_human(
                     issue["number"],
-                    reason_class=Reason.START_FAILED,
+                    reason=Reason.START_FAILED,
                     detail=(
-                        "Creating a Devin session failed. A session may or may not have been "
-                        "created, so this issue is held rather than retried automatically — that "
-                        "cannot bill twice. Check the Devin dashboard, then re-apply the label."
+                        "Creating a Devin session failed. The attempt is recorded, so nothing will "
+                        "be billed twice; check the Devin dashboard, then re-apply the label to "
+                        "try again."
                     ),
                 )
 
-        if deferred_for_budget is not None:
-            await self.effects.notify(
-                deferred_for_budget,
-                reason_class=Reason.BUDGET_EXHAUSTED,
-                detail=(
-                    f"The global ACU budget ({self.settings.global_acu_budget}) is spent, so no "
-                    "further sessions will start. Raise `GLOBAL_ACU_BUDGET` to continue."
-                ),
-            )
-
-    async def _create_session(self, issue: dict[str, Any], *, attempt: int) -> None:
+    async def _create_session(self, issue: dict[str, Any]) -> None:
         number = issue["number"]
+        # Reserve the attempt before anything billable. A failure after this point cannot lead to a
+        # second session for the same attempt, and a later re-label is still recognised as a retry.
+        attempt = self.repo.begin_attempt(number)
+
         tags = [ORCHESTRATOR_TAG, f"repo:{self.settings.github_repo}", f"issue:{number}"]
         if issue.get("klass"):
             tags.append(issue["klass"])
@@ -284,37 +275,39 @@ class Orchestrator:
                 f"- ACU cap: {self.settings.max_acu_per_session}\n\n"
                 "Progress will be reported here."
             ),
-            key=f"issue:{number}:started:{session['session_id']}",
+            key=f"session:{session['session_id']}:started",
         )
 
     # -- pass 3: track sessions --------------------------------------------
 
     async def track_sessions(self) -> None:
         max_age = self.settings.max_session_age_hours * 3600
-        for record in self.repo.sessions():
-            if liveness(record) is Liveness.CLOSED:
+        for ctx in self.contexts():
+            if ctx["status"] is IssueStatus.MERGED:
+                # The outcome is settled; nothing a session does now changes it.
                 continue
-            # The backstop for anything the status vocabulary does not express: an unrecognised
-            # status, or a session that rests indefinitely having produced nothing. Age alone, not
-            # age-and-unfinished — v1's extra condition exempted the runaway case and killed the
-            # healthy one.
-            if now() - record["created_at"] > max_age:
-                self.repo.close_session(record["session_id"], "timeout")
-                self.repo.bump("sessions_timed_out")
-                await self.effects.notify(
-                    record["issue_number"],
-                    reason_class=Reason.SESSION_TIMEOUT,
-                    detail=(
-                        f"The session has been open for over "
-                        f"{self.settings.max_session_age_hours:.0f}h and is no longer tracked."
-                    ),
-                    session=record,
-                )
-                continue
-            try:
-                await self._advance_session(record)
-            except Exception:
-                logger.exception("advancing session %s failed", record["session_id"])
+            for record in ctx["sessions"]:
+                if liveness(record) is Liveness.CLOSED:
+                    continue
+                # The backstop for anything the status vocabulary does not express: an unrecognised
+                # status, or a session that rests indefinitely having produced nothing.
+                if now() - record["created_at"] > max_age:
+                    self.repo.close_session(record["session_id"], "timeout")
+                    self.repo.bump("sessions_timed_out")
+                    await self.effects.flag_human(
+                        record["issue_number"],
+                        reason=Reason.SESSION_TIMEOUT,
+                        detail=(
+                            "The session has been open for over "
+                            f"{self.settings.max_session_age_hours:.0f}h and is no longer tracked."
+                        ),
+                        session=record,
+                    )
+                    continue
+                try:
+                    await self._advance_session(record)
+                except Exception:
+                    logger.exception("advancing session %s failed", record["session_id"])
 
     async def _advance_session(self, record: dict[str, Any]) -> None:
         session_id = record["session_id"]
@@ -352,28 +345,30 @@ class Orchestrator:
 
         if produced:
             await self._report_completion(current, structured, pulls)
+            outcome = structured.get("outcome") if isinstance(structured, dict) else None
+            if outcome in ("could_not_fix", "partially_fixed") and not pulls:
+                await self.effects.flag_human(
+                    record["issue_number"],
+                    reason=Reason.NOT_FIXED,
+                    detail=f"Devin reported `{outcome}` and opened no pull request.",
+                    session=current,
+                )
+            return
 
         if reason and reason.startswith("cost_halt"):
-            await self.effects.notify(
+            await self.effects.flag_human(
                 record["issue_number"],
-                reason_class=Reason.COST_HALT,
+                reason=Reason.COST_HALT,
                 detail=f"Devin stopped: `{detail}`. No message can revive this session.",
                 session=current,
             )
-        elif reason == "error":
-            await self.effects.notify(
+        elif reason:
+            await self.effects.flag_human(
                 record["issue_number"],
-                reason_class=Reason.SESSION_ERROR,
-                detail="The Devin session ended in an error. Re-apply the label to try again.",
-                session=current,
-            )
-        elif reason == "exit" and not produced:
-            await self.effects.notify(
-                record["issue_number"],
-                reason_class=Reason.SESSION_ERROR,
+                reason=Reason.SESSION_ERROR,
                 detail=(
-                    "The Devin session ended without producing a pull request or a final result. "
-                    "Re-apply the label to try again."
+                    f"The session ended (`{status}`) without producing a pull request or a final "
+                    "result. Re-apply the label to try again."
                 ),
                 session=current,
             )
@@ -397,12 +392,15 @@ class Orchestrator:
 
     async def _handle_blocked(self, session: dict[str, Any]) -> None:
         if session["nudges"] < self.settings.max_nudges:
+            # Keyed on the session and the nudge ordinal. The ordinal only ever increases here;
+            # a human reply resets the budget, and the reset also clears the recorded keys' effect
+            # by moving the ordinal forward — see `reset_budgets`.
             sent = await self.effects.message_session(
                 session,
                 reason="auto_nudge",
                 body=prompts.nudge_message(),
-                key=f"session:{session['session_id']}:nudge:{session['nudges'] + 1}",
-                respect_grace=True,
+                key=f"session:{session['session_id']}:nudge:{session['nudges'] + 1}:"
+                f"{int(session['created_at'])}",
             )
             if sent:
                 self.repo.bump_nudges(session["session_id"])
@@ -410,12 +408,12 @@ class Orchestrator:
 
         question = ""
         try:
-            question = last_devin_message(await self.devin.list_messages(session["session_id"]))
+            question = await self.devin.latest_devin_message(session["session_id"])
         except Exception:
             logger.debug("could not read messages for %s", session["session_id"], exc_info=True)
-        await self.effects.notify(
+        await self.effects.flag_human(
             session["issue_number"],
-            reason_class=Reason.BLOCKED_ON_QUESTION,
+            reason=Reason.BLOCKED_ON_QUESTION,
             detail=(
                 f"Devin is blocked on a question and the automatic nudge limit "
                 f"({self.settings.max_nudges}) is exhausted."
@@ -470,7 +468,7 @@ class Orchestrator:
                 self.repo.update_pr(number, merged_at=now())
                 self.repo.bump("prs_merged")
                 if record["issue_number"]:
-                    await self.effects.resolve(record["issue_number"])
+                    await self.effects.clear_human_flag(record["issue_number"])
                 logger.info("PR #%s merged", number)
             return
         if pull.get("state") == "closed":
@@ -478,9 +476,9 @@ class Orchestrator:
                 self.repo.update_pr(number, closed_at=now())
                 self.repo.bump("prs_closed_unmerged")
                 if record["issue_number"]:
-                    await self.effects.notify(
+                    await self.effects.flag_human(
                         record["issue_number"],
-                        reason_class=Reason.PR_CLOSED_UNMERGED,
+                        reason=Reason.PR_CLOSED_UNMERGED,
                         detail=(
                             f"{record['url']} was closed without merging, so this issue is not "
                             "fixed. Re-apply the label to try again."
@@ -490,7 +488,9 @@ class Orchestrator:
 
         sha = pull["head"]["sha"]
         settled, conclusion = await self.github.checks_settled(sha)
-        if settled and not record["ci_settled_at"]:
+        if settled:
+            # Rewritten each time, not once: after a self-correction round the earlier verdict is
+            # stale, and freezing it made every later CI wait look like human review time.
             self.repo.update_pr(number, ci_settled_at=now(), ci_conclusion=conclusion)
         if settled and conclusion == "failure":
             await self._feed_ci_failure(number, sha)
@@ -508,25 +508,20 @@ class Orchestrator:
         if not sha:
             pull = await self.github.get_pull(pr_number)
             sha = pull["head"]["sha"]
+        if record["ci_last_sha"] == sha:
+            # One round per commit. Without this the whole budget goes on re-reporting the same red
+            # commit on consecutive polls, minutes apart, before Devin can push anything.
+            self.repo.bump("ci_feedback_deduped")
+            return
 
         if record["ci_rounds"] >= self.settings.max_ci_feedback_rounds:
-            await self.effects.notify(
-                record["issue_number"],
-                reason_class=Reason.CI_UNRESOLVED,
-                detail=(
-                    f"CI is still failing on {record['url']} after "
-                    f"{self.settings.max_ci_feedback_rounds} self-correction attempts. Note that "
-                    "some checks on this fork are flaky or cannot run at all — see the CI baseline "
-                    "in the README before assuming the code is at fault."
-                ),
-                session=session,
-            )
+            await self._flag_ci_unresolved(record, session)
             return
 
         failed = await self.github.failed_check_summary(sha)
         if not failed:
-            # Settled-as-failure with nothing named means the two reads disagreed transiently. The
-            # ledger key is never claimed here, so the retry fires once the names appear.
+            # Settled-as-failure with nothing named means the two reads disagreed transiently.
+            # Nothing is recorded, so the retry fires once the names appear.
             self.repo.bump("ci_failure_without_detail")
             return
 
@@ -540,51 +535,82 @@ class Orchestrator:
             key=f"pr:{pr_number}:ci:{sha}",
             issue_number=record["issue_number"],
         ):
-            self.repo.update_pr(pr_number, ci_rounds=rounds)
+            self.repo.update_pr(pr_number, ci_rounds=rounds, ci_last_sha=sha)
             logger.info("handed CI failure back for PR #%s (round %s)", pr_number, rounds)
+        else:
+            # The message did not land — the session is closed, or it is inside the grace window.
+            # A closed session can never receive it, so that is a dead end a human must see.
+            if liveness(session) is Liveness.CLOSED:
+                await self._flag_ci_unresolved(record, session)
 
-    async def _forward_comment(
-        self,
-        target: dict[str, Any] | None,
-        *,
-        author: str,
-        comment: str,
-        comment_id: int,
-        is_review: bool,
+    async def _flag_ci_unresolved(self, record: dict[str, Any], session: dict[str, Any]) -> None:
+        await self.effects.flag_human(
+            record["issue_number"],
+            reason=Reason.CI_UNRESOLVED,
+            detail=(
+                f"CI is failing on {record['url']} and Devin cannot take it further. Note that "
+                "some checks on this fork are flaky or cannot run at all — see the CI baseline in "
+                "the README before assuming the code is at fault."
+            ),
+            session=session,
+        )
+
+    async def _forward_review(
+        self, pr_number: int, author: str, comment: str, comment_id: int
     ) -> None:
-        """Forward trusted human text to the session working on this issue.
+        """Send reviewer feedback to the session that produced *this* pull request."""
+        record = self.repo.pull_request(pr_number)
+        if not record or not record["session_id"]:
+            self.repo.bump("review_comment_unmatched")
+            return
+        session = self.repo.session(record["session_id"])
+        if not session:
+            return
+
+        await self.effects.message_session(
+            session,
+            reason="review_feedback",
+            body=prompts.review_feedback_message(
+                pr_url=record["url"] or "", reviewer=author, comment=comment
+            ),
+            key=f"comment:{comment_id}",
+            respect_grace=False,
+            issue_number=record["issue_number"],
+        )
+
+    async def _forward_reply(
+        self, issue_number: int, author: str, comment: str, comment_id: int
+    ) -> None:
+        """Forward a human's answer to the session working on this issue.
 
         Keyed on the comment id, so a second reply is delivered rather than dropped and delivery
-        does not depend on the issue being in a particular state. v1 gated on an issue-state check
-        that another path reset, and silently lost every reply after the first.
+        does not depend on the issue being in a particular state.
         """
-        if not target or target.get("issue_number") is None:
-            return
-        issue_number = target["issue_number"]
         session = self.repo.latest_session_for_issue(issue_number)
         if not session:
             return
 
-        pr = self.repo.pull_request(target["pr_number"]) if is_review else None
-        body = (
-            prompts.review_feedback_message(
-                pr_url=(pr or {}).get("url") or "", reviewer=author, comment=comment
-            )
-            if is_review
-            else prompts.human_reply_message(author=author, comment=comment)
-        )
-
-        if await self.effects.message_session(
+        sent = await self.effects.message_session(
             session,
-            reason="review_feedback" if is_review else "human_reply",
-            body=body,
+            reason="human_reply",
+            body=prompts.human_reply_message(author=author, comment=comment),
             key=f"comment:{comment_id}",
-            issue_number=issue_number,
-        ):
-            # A human took over and handed back, so the automatic budgets start again. Without this
-            # the next poll re-enters the exhausted branch and re-raises what was just answered.
+            respect_grace=False,
+        )
+        if sent:
+            # A human took over and handed back, so the automatic budgets start again.
             self.repo.reset_budgets(session["session_id"])
-            await self.effects.resolve(issue_number)
+            await self.effects.clear_human_flag(issue_number)
+        elif liveness(session) is Liveness.CLOSED:
+            self.repo.bump("human_reply_undeliverable")
+            await self.effects.comment(
+                issue_number,
+                body=(
+                    "⚠️ That reply could not be delivered: the Devin session is closed and cannot "
+                    "be revived. Re-apply the label to start a fresh attempt."
+                ),
+                key=f"comment:{comment_id}:undeliverable",
+            )
 
     # -- pass 5: recovery and analytics ------------------------------------
 
@@ -608,67 +634,57 @@ class Orchestrator:
                 logger.exception("resync could not register #%s", issue["number"])
 
     async def refresh_insights(self) -> None:
-        """Reconcile against Devin's Analytics endpoint, following pagination.
+        """Reconcile against Devin's Analytics endpoint.
 
         The tag filter is sent but not trusted to have been applied: the endpoint accepts unknown
         query parameters silently, so a renamed filter would return the whole organization rather
-        than an error and other people's sessions would enter the cost figures. Rows are matched
-        against session ids this orchestrator created.
+        than an error. Rows are matched against session ids this orchestrator created.
+
+        One page. At this scale there are a handful of sessions, and a truncation is visible as a
+        gap between `insights_applied` and the session count rather than silently wrong.
         """
-        applied = foreign = 0
-        cursor: str | None = None
         try:
-            for _ in range(20):
-                response = await self.devin.insights(
-                    tags=[ORCHESTRATOR_TAG], first=200, after=cursor
-                )
-                for row in collection_items(response):
-                    session_id = row.get("session_id")
-                    if not session_id:
-                        continue
-                    if self.repo.apply_insight(
-                        session_id,
-                        acus=float(row.get("acus_consumed") or 0),
-                        devin_messages=row.get("num_devin_messages"),
-                        user_messages=row.get("num_user_messages"),
-                        session_size=row.get("session_size"),
-                    ):
-                        applied += 1
-                    else:
-                        foreign += 1
-                if not isinstance(response, dict) or not response.get("has_next_page"):
-                    break
-                cursor = response.get("end_cursor")
-                if not cursor:
-                    break
+            response = await self.devin.insights(tags=[ORCHESTRATOR_TAG], first=200)
         except Exception:
             logger.exception("insights refresh failed")
             self.repo.bump("insights_errors")
             return
 
+        applied = foreign = 0
+        for row in collection_items(response):
+            session_id = row.get("session_id")
+            if not session_id:
+                continue
+            if self.repo.apply_insight(
+                session_id,
+                acus=float(row.get("acus_consumed") or 0),
+                devin_messages=row.get("num_devin_messages"),
+                user_messages=row.get("num_user_messages"),
+                session_size=row.get("session_size"),
+            ):
+                applied += 1
+            else:
+                foreign += 1
+
         self.repo.bump("insights_applied", applied)
         if foreign:
-            # A non-zero value means the tag filter is not doing what the request asked for.
+            # Non-zero means the tag filter is not doing what the request asked for.
             self.repo.bump("insights_rows_not_ours", foreign)
 
     # -- the view the dashboard and the metrics share -----------------------
 
     def issue_view(self) -> list[dict[str, Any]]:
         rows = []
-        for issue in self.repo.issues():
-            sessions = self.repo.sessions(issue["number"])
-            pulls = self.repo.pull_requests(issue["number"])
-            notifications = self.repo.open_notifications(issue["number"])
+        for ctx in self.contexts():
+            sessions, pulls = ctx["sessions"], ctx["pulls"]
             session = sessions[-1] if sessions else None
             merged = next((p for p in pulls if p["merged_at"]), None)
             rows.append(
                 {
-                    **issue,
-                    "status": issue_status(issue, sessions, pulls, notifications),
+                    **ctx["issue"],
+                    "status": ctx["status"],
                     "session": session,
                     "pull_request": merged or (pulls[-1] if pulls else None),
-                    "notifications": notifications,
-                    "attempts": len(sessions),
                     "structured_output": json.loads(session["structured_output"])
                     if session and session["structured_output"]
                     else None,
@@ -676,12 +692,5 @@ class Orchestrator:
             )
         return rows
 
-    def status_counts(self) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for row in self.issue_view():
-            key = str(row["status"])
-            counts[key] = counts.get(key, 0) + 1
-        return counts
 
-
-__all__ = ["ORCHESTRATOR_TAG", "IssueStatus", "Orchestrator", "parse_pr_number"]
+__all__ = ["ORCHESTRATOR_TAG", "Orchestrator", "parse_pr_number"]

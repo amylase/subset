@@ -126,8 +126,30 @@ class DevinClient:
             "POST", f"/sessions/{session_id}/messages", json={"message": message}
         )
 
-    async def list_messages(self, session_id: str, *, first: int = 50) -> Any:
-        return await self._call("GET", f"/sessions/{session_id}/messages", params={"first": first})
+    async def latest_devin_message(self, session_id: str) -> str:
+        """The newest Devin turn, following pagination to the end.
+
+        Messages are returned oldest-first with no reverse option, so reading one page returns the
+        *start* of the conversation. On a session with more than a page of turns that meant the
+        escalation comment quoted an opening remark instead of the question that actually blocked
+        it — on the one path where getting it right matters.
+        """
+        cursor: str | None = None
+        latest = ""
+        for _ in range(20):
+            params: dict[str, Any] = {"first": 200}
+            if cursor:
+                params["after"] = cursor
+            page = await self._call("GET", f"/sessions/{session_id}/messages", params=params)
+            found = last_devin_message(page)
+            if found:
+                latest = found
+            if not isinstance(page, dict) or not page.get("has_next_page"):
+                break
+            cursor = page.get("end_cursor")
+            if not cursor:
+                break
+        return latest
 
     async def insights(
         self, *, tags: list[str] | None = None, first: int = 100, after: str | None = None
@@ -162,17 +184,17 @@ class DevinClient:
     async def list_schedules(self) -> Any:
         return await self._call("GET", "/schedules")
 
-    async def create_schedule(
-        self, prompt: str, cron: str, *, timezone: str = "UTC", title: str | None = None
-    ) -> Any:
-        payload: dict[str, Any] = {
-            "prompt": prompt,
-            "cron_schedule": cron,
-            "timezone": timezone,
-        }
-        if title:
-            payload["title"] = title
-        return await self._call("POST", "/schedules", json=payload)
+    async def create_schedule(self, name: str, prompt: str, frequency: str) -> Any:
+        """Create a recurring scheduled session.
+
+        The fields are ``name``, ``prompt`` and ``frequency``. Confirmed against the live endpoint:
+        omitting ``name`` returns ``422 name: Field required``, and ``name`` + ``prompt`` alone
+        returns ``422 frequency is required for recurring schedules``. An earlier version sent
+        ``title``/``cron_schedule``/``timezone`` from a misreading and would have failed every time.
+        """
+        return await self._call(
+            "POST", "/schedules", json={"name": name, "prompt": prompt, "frequency": frequency}
+        )
 
 
 def collection_items(response: Any) -> list[dict[str, Any]]:

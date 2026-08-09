@@ -157,7 +157,6 @@ def test_metrics_read_the_columns_the_repo_actually_writes(client):
         sessions=repo.sessions(),
         pull_requests=repo.pull_requests(),
         interventions=repo.interventions(),
-        notifications=repo.notifications(),
         counters=repo.counters(),
         acu_unit_cost_usd=2.0,
         manual_effort_hours_per_issue=4.0,

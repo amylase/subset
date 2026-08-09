@@ -120,7 +120,7 @@ async def test_zero_check_runs_is_pending_not_success():
 
 @pytest.mark.parametrize(
     "conclusion",
-    ["failure", "timed_out", "cancelled", "action_required", "stale", "startup_failure"],
+    ["failure", "timed_out", "cancelled", "action_required"],
 )
 async def test_every_failing_conclusion_is_reported_as_failure(conclusion):
     client = _github(_checks([run(), run("bad", conclusion=conclusion)]))
@@ -268,3 +268,60 @@ def test_ordering_uses_created_at_not_position():
 @pytest.mark.parametrize("payload", [{}, {"items": []}, [], None, {"items": [1, 2]}])
 def test_unreadable_message_payloads_degrade_to_empty(payload):
     assert last_devin_message(payload) == ""
+
+
+# --- the fakes must not drift from the real clients --------------------------
+
+
+def test_the_fakes_mirror_the_real_client_signatures():
+    """A drifted signature makes the whole integration suite a fiction.
+
+    Two mutations proved it: making the real `send_message` keyword-only, and renaming the real
+    `comment`, both left 216 tests green while production would raise on every message and every
+    comment. The parity was correct by hand and guarded by nothing.
+    """
+    import inspect
+
+    from tests.fakes import FakeDevin, FakeGitHub
+
+    for real, fake in ((DevinClient, FakeDevin), (GitHubClient, FakeGitHub)):
+        shared = {
+            name
+            for name in vars(fake)
+            if not name.startswith("_") and inspect.iscoroutinefunction(getattr(fake, name))
+        } & {name for name in vars(real) if not name.startswith("_")}
+        assert shared, f"{fake.__name__} shares no methods with {real.__name__}"
+        for name in sorted(shared):
+            real_sig = inspect.signature(getattr(real, name)).parameters
+            fake_sig = inspect.signature(getattr(fake, name)).parameters
+            assert fake_sig == real_sig, f"{fake.__name__}.{name} has drifted from {real.__name__}"
+            assert inspect.iscoroutinefunction(getattr(real, name)), name
+
+
+def test_every_client_method_the_orchestrator_calls_exists_on_a_fake():
+    """The integration suite only proves anything about methods the fakes actually implement."""
+    from tests.fakes import FakeDevin, FakeGitHub
+
+    used = {
+        FakeDevin: {
+            "create_session",
+            "get_session",
+            "send_message",
+            "latest_devin_message",
+            "insights",
+        },
+        FakeGitHub: {
+            "whoami",
+            "get_issue",
+            "list_issues_with_label",
+            "comment",
+            "add_label",
+            "remove_label",
+            "get_pull",
+            "checks_settled",
+            "failed_check_summary",
+        },
+    }
+    for fake, names in used.items():
+        missing = names - set(vars(fake))
+        assert not missing, f"{fake.__name__} is missing {sorted(missing)}"

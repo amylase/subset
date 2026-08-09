@@ -99,9 +99,11 @@ class FakeDevin:
             raise self.message_error
         self.messages.append((session_id, message))
 
-    async def list_messages(self, session_id: str, *, first: int = 50) -> Any:
+    async def latest_devin_message(self, session_id: str) -> str:
         await asyncio.sleep(0)
-        return self.message_log
+        from app.clients.devin import last_devin_message
+
+        return last_devin_message(self.message_log)
 
     async def insights(
         self, *, tags: list[str] | None = None, first: int = 100, after: str | None = None

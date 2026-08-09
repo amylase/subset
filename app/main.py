@@ -98,8 +98,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("orchestrator identity: %s", app.state.own_login or "unknown")
     if not app.state.own_login:
         logger.warning(
-            "own login unknown: comments written by this service may be forwarded back to Devin. "
-            "Set SELF_LOGIN to make this deterministic."
+            "own login unresolved: comment forwarding is disabled until it is known, because our "
+            "own comments cannot be told from a maintainer's. Set SELF_LOGIN to fix this."
         )
 
     task = asyncio.create_task(app.state.orchestrator.run_forever(), name="reconcile-loop")
@@ -135,7 +135,6 @@ def _metrics(request: Request) -> metrics_mod.Metrics:
         sessions=repo.sessions(),
         pull_requests=repo.pull_requests(),
         interventions=repo.interventions(),
-        notifications=repo.notifications(),
         counters=repo.counters(),
         acu_unit_cost_usd=settings.acu_unit_cost_usd,
         manual_effort_hours_per_issue=settings.manual_effort_hours_per_issue,
@@ -178,7 +177,7 @@ async def force_register(
     on the issue, nothing happens.
     """
     _require_admin(request, x_admin_token)
-    request.app.state.repo.enqueue("issue_labeled", {"number": number}, provenance="system")
+    request.app.state.repo.enqueue("issue_labeled", {"number": number})
     return {"status": "queued", "issue": number}
 
 

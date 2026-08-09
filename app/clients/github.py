@@ -35,8 +35,6 @@ FAILING_CONCLUSIONS = frozenset(
         "timed_out",
         "cancelled",
         "action_required",
-        "stale",
-        "startup_failure",
     }
 )
 
@@ -95,10 +93,20 @@ class GitHubClient:
 
     async def list_issues_with_label(self, label: str) -> list[dict[str, Any]]:
         """Open issues carrying ``label``. Backs the resync pass that recovers lost webhooks."""
-        items = await self._call(
-            "GET", "/issues", params={"labels": label, "state": "open", "per_page": 100}
-        )
-        return [i for i in (items or []) if "pull_request" not in i]
+        found: list[dict[str, Any]] = []
+        page = 1
+        while page <= 10:
+            items = await self._call(
+                "GET",
+                "/issues",
+                params={"labels": label, "state": "open", "per_page": 100, "page": page},
+            )
+            batch = items or []
+            found.extend(i for i in batch if "pull_request" not in i)
+            if len(batch) < 100:
+                return found
+            page += 1
+        return found
 
     async def comment(self, number: int, body: str) -> Any:
         return await self._call("POST", f"/issues/{number}/comments", json={"body": body})
@@ -131,8 +139,11 @@ class GitHubClient:
         runs: list[dict[str, Any]] = []
         page = 1
         while True:
-            data = await self._call(
-                "GET", f"/commits/{sha}/check-runs", params={"per_page": 100, "page": page}
+            data = (
+                await self._call(
+                    "GET", f"/commits/{sha}/check-runs", params={"per_page": 100, "page": page}
+                )
+                or {}
             )
             batch = data.get("check_runs", [])
             runs.extend(batch)

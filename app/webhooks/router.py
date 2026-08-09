@@ -83,8 +83,8 @@ async def github_webhook(request: Request) -> Response:
     if intent is None:
         return Response(status_code=202, content="no action for this event")
 
-    kind, data, provenance = intent
-    repo.enqueue(kind, data, provenance=str(provenance))
+    kind, data = intent
+    repo.enqueue(kind, data)
     repo.bump("webhook_accepted")
     logger.info("queued %s from delivery %s", kind, delivery)
     return Response(status_code=202, content=f"queued: {kind}")

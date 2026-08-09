@@ -163,7 +163,6 @@ def issue_status(
     issue: dict[str, Any],
     sessions: list[dict[str, Any]],
     pulls: list[dict[str, Any]],
-    open_notifications: list[dict[str, Any]],
 ) -> IssueStatus:
     """Where an issue stands, derived from facts. The single definition, used everywhere.
 
@@ -172,14 +171,18 @@ def issue_status(
     """
     if any(p.get("merged_at") for p in pulls):
         return IssueStatus.MERGED
-    if open_notifications:
+    if issue.get("needs_human_at") is not None:
         return IssueStatus.AWAITING_HUMAN
     if any(p.get("opened_at") and not p.get("merged_at") and not p.get("closed_at") for p in pulls):
         return IssueStatus.PR_OPEN
-    if any(liveness(s) is not Liveness.CLOSED and s.get("produced_at") is None for s in sessions):
-        return IssueStatus.IN_PROGRESS
+    # A retry request outranks an in-flight session on purpose. Re-applying the label is an
+    # operator saying the current attempt is not going anywhere — most often while it sleeps,
+    # blocked on a question nobody wants to answer. Ranking `in_progress` first would make that
+    # instruction a no-op for the commonest case.
     if wants_session(issue, sessions):
         return IssueStatus.QUEUED
+    if any(liveness(s) is not Liveness.CLOSED and s.get("produced_at") is None for s in sessions):
+        return IssueStatus.IN_PROGRESS
     return IssueStatus.EXHAUSTED
 
 
@@ -191,19 +194,28 @@ def wants_session(issue: dict[str, Any], sessions: list[dict[str, Any]]) -> bool
     machinery a retry needs — v1 required a state machine to be nudged into exactly the right place
     and silently did nothing for the most common escalation shape.
     """
-    if not sessions:
+    if not issue.get("attempts"):
         return True
     retry_at = issue.get("retry_requested_at")
     if retry_at is None:
         return False
-    return retry_at > max(s["created_at"] for s in sessions)
+    # Compared against the last attempt, not the last session: an attempt whose API call failed
+    # leaves no session row, and a retry after it must still count.
+    last = issue.get("last_attempt_at") or 0.0
+    if sessions:
+        last = max(last, max(s["created_at"] for s in sessions))
+    return retry_at > last
 
 
-def occupies_slot(session: dict[str, Any]) -> bool:
+def occupies_slot(session: dict[str, Any], *, issue_is_terminal: bool) -> bool:
     """Whether a session counts against the concurrency cap.
 
-    Not closed, full stop. v1 counted only sessions that were *awake*, so blocked and sleeping
-    sessions escaped the cap entirely — and both resume spending the moment they are messaged, so
-    concurrent spend was unbounded.
+    Not closed, and belonging to an issue that has not finished. Counting only *awake* sessions
+    would let blocked and sleeping ones escape the cap, and both resume spending the moment they
+    are messaged. Ignoring the issue outcome is the opposite mistake: a session that opened a pull
+    request and went to sleep would hold its slot after that pull request merged, and two merged
+    issues would stall the whole pipeline until the age watchdog fired.
     """
+    if issue_is_terminal:
+        return False
     return liveness(session) is not Liveness.CLOSED
