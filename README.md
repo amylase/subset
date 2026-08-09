@@ -346,6 +346,11 @@ Stated plainly, because a system whose reporting hides its own gaps is not worth
   the issue is flagged and a human re-applies the label. `429` is the exception — that request
   was refused before it ran. The cost of this is a rare manual retry; the cost of the
   alternative was up to five billable sessions for one attempt, four of them untracked.
+- **The merge-conflict handler has not fired on real data.** It is implemented and covered by five
+  tests, but the one real conflict this system has seen was resolved by Devin itself — it merged
+  `master` into its own branch four minutes before the handler was deployed, with nothing having
+  asked it to. The handler exists because that is a happy accident to benefit from, not a
+  behaviour to depend on.
 - **Polling, not push.** No Devin push callbacks were found in the v3 documentation, so session
   state is pulled on a 10-second cadence, as the official examples do.
 - **No per-day billing breakdown.** The enterprise consumption endpoints
