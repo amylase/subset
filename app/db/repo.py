@@ -97,14 +97,20 @@ class Repo:
 
     # --- deliveries and inbox ----------------------------------------------
 
-    def record_delivery(self, delivery_id: str, event: str, action: str | None) -> bool:
-        """Record a delivery id. ``True`` if new. Redeliveries reuse the original GUID."""
+    def record_delivery(
+        self, delivery_id: str, body_sha: str, event: str, action: str | None
+    ) -> bool:
+        """Record a delivery. ``True`` if it is new by *both* keys.
+
+        One statement, two unique constraints. The GUID catches GitHub's redelivery button; the
+        body hash catches a replay, which the GUID cannot because it is an unsigned header.
+        """
         with self._conn() as conn:
             return (
                 conn.execute(
-                    "INSERT OR IGNORE INTO deliveries (delivery_id, event, action, received_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (delivery_id, event, action, now()),
+                    "INSERT OR IGNORE INTO deliveries "
+                    "(delivery_id, body_sha, event, action, received_at) VALUES (?, ?, ?, ?, ?)",
+                    (delivery_id, body_sha, event, action, now()),
                 ).rowcount
                 == 1
             )

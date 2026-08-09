@@ -106,14 +106,24 @@ CREATE TABLE IF NOT EXISTS inbox (
     last_error    TEXT
 );
 
--- Webhook delivery GUIDs. GitHub sends no timestamp header, so this is the only replay defence
--- available; note the GUID is outside the signed body (see the README's limitations).
+-- Webhook deliveries, deduplicated on two keys.
+--
+-- The GUID catches GitHub's own redelivery, which reuses it. It cannot catch a replay, because the
+-- GUID is a header and only the *body* is signed — an attacker holding one captured (body,
+-- signature) pair can resend it with a fresh GUID forever. Since a repeated `issues/labeled` is
+-- read as "try again" and starts a paid session, that was a direct route to the ACU budget.
+--
+-- The body hash is the half that is actually authenticated. Two genuine events never produce
+-- byte-identical bodies: every payload carries the full issue object with its timestamps.
 CREATE TABLE IF NOT EXISTS deliveries (
     delivery_id TEXT PRIMARY KEY,
+    body_sha    TEXT NOT NULL,
     event       TEXT NOT NULL,
     action      TEXT,
     received_at REAL NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_body ON deliveries (body_sha);
 
 -- Anything a human or the system did to help a session along. Drives the autonomy rate.
 CREATE TABLE IF NOT EXISTS interventions (

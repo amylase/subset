@@ -144,8 +144,8 @@ costs more credibility than it buys.
 
 | Concern | How |
 | --- | --- |
-| Delivery dedup | `X-GitHub-Delivery` GUID persisted; redeliveries reuse the GUID, so replays are caught |
-| Business dedup | One active session per issue — re-labelling cannot double-spend ACUs |
+| Delivery dedup | The `X-GitHub-Delivery` GUID **and** `sha256(body)`. The GUID catches GitHub's redelivery; the body hash catches a replay, which the GUID cannot because it is an unsigned header |
+| Attempt dedup | The attempt counter is incremented before the billable call, so a failure mid-flight can never bill the same attempt twice |
 | Retries | Exponential backoff with jitter on `429` and `5xx`, honouring `Retry-After` |
 | Concurrency | Bounded concurrent sessions |
 | Cost caps | `max_acu_limit` per session, plus a global ACU budget checked before every start |
@@ -204,11 +204,16 @@ python scripts/bootstrap_devin.py
 
 ### Exposing the webhook
 
-Only `/webhooks/github` needs to be reachable from GitHub:
+Only `POST /webhooks/github` needs to be reachable from GitHub. The quick command below exposes
+the **whole app**, including the dashboard and `/api/*`, which are unauthenticated:
 
 ```bash
 cloudflared tunnel --url http://localhost:8000
 ```
+
+That is fine for a short demo on a throwaway hostname and wrong for anything longer — `/api/issues`
+returns Devin's `root_cause` write-ups for security fixes whose pull requests have not merged yet.
+For anything beyond a demo, tunnel only the webhook path or put a token in front of the reads.
 
 Then on the repository: **Settings → Webhooks → Add webhook**, payload URL
 `https://<tunnel>/webhooks/github`, content type `application/json`, the same secret as
@@ -224,7 +229,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-168 tests covering the orchestrator itself, with no network and no credentials required:
+238 tests covering the orchestrator itself, with no network and no credentials required:
 
 - **The loop, end to end** — label → session → pull request → completion comment → merge, driven
   against recording doubles and a real database. Also: the concurrency cap actually holding back a
@@ -304,6 +309,23 @@ Stated plainly, because a system whose reporting hides its own gaps is not worth
 
 - **Single instance.** SQLite and an in-process loop. Correct at this scale; horizontal scaling
   would need a real queue and leader election.
+- **The issue body is not fenced against prompt injection.** The orchestrator fences everything
+  it forwards — comments, and the issue title in the session prompt — but Devin reads the issue
+  body itself from the URL, and on a public fork anyone can write it. The only control there is
+  an in-band instruction telling Devin to treat the body as evidence rather than instructions.
+  Closing it properly means fetching the body server-side and passing it fenced; that is not
+  built.
+- **The dashboard and read API are unauthenticated**, and the tunnel command above publishes
+  them. See the note in that section.
+- **Effects are recorded after they succeed, not reserved before.** A crash between an API call
+  and its record repeats that effect once — a duplicate comment, at worst a duplicate nudge.
+  This is deliberate: the exactly-once machinery it replaced derived keys from mutable counters
+  and could wedge an issue permanently, which is a worse failure in a system a human watches.
+  Session creation is protected separately, by incrementing the attempt before it spends.
+- **A retry request outranks a running session.** Re-applying the label starts a fresh attempt
+  even if the previous session is still working; the old session is not stopped, because the
+  v3 API exposes no terminate (probed: `/terminate` and `/stop` are 404). It sleeps at ~0.1 ACU
+  and is capped by `MAX_ACU_PER_SESSION`, so the cost is bounded but not zero.
 - **Polling, not push.** No Devin push callbacks were found in the v3 documentation, so session
   state is pulled on a 10-second cadence, as the official examples do.
 - **No per-day billing breakdown.** The enterprise consumption endpoints
@@ -335,14 +357,14 @@ app/
     github.py             issues, comments, labels, pull requests, check runs
     http.py               retry with exponential backoff and jitter
   core/
-    orchestrator.py       the reconcile loop; the only place with side effects
-    state.py              Devin status -> phase; completion detection
-    policy.py             caps and limits, as pure functions
+    orchestrator.py       the reconcile loop; decides, never writes
+    effects.py            the only writer: Devin and GitHub side effects
+    state.py              facts -> issue status and session liveness, pure
     metrics.py            metric arithmetic, no I/O
     prompts.py            everything the orchestrator says to Devin
   db/
     schema.sql  repo.py   SQLite; timestamps are the point
 scripts/
   bootstrap_devin.py      register the playbook and the weekly schedule
-tests/                    88 tests, no network required
+tests/                    238 tests, no network required
 ```

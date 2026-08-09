@@ -152,3 +152,39 @@ def test_missing_delivery_header_is_rejected(webhook_app, repo):
             headers={"X-GitHub-Event": "issues", "X-Hub-Signature-256": signature},
         )
     assert response.status_code == 400
+
+
+def test_a_replayed_body_with_a_fresh_guid_is_refused(webhook_app, repo):
+    """The GUID is an unsigned header; only the body is signed.
+
+    A captured (body, signature) pair could otherwise be resent forever with a new GUID, and a
+    repeated `issues/labeled` reads as "try again" — which starts a paid Devin session each time.
+    """
+    first = post(webhook_app, "issues", labeled(), delivery="guid-a")
+    second = post(webhook_app, "issues", labeled(), delivery="guid-b")
+
+    assert first.status_code == 202
+    assert second.status_code == 200
+    assert len(repo.pending_inbox()) == 1
+    assert repo.counters().get("webhook_duplicates") == 1
+
+
+def test_a_genuinely_different_body_still_gets_through(webhook_app, repo):
+    post(webhook_app, "issues", labeled(number=42), delivery="guid-a")
+    post(webhook_app, "issues", labeled(number=43), delivery="guid-b")
+    assert [p["payload"]["number"] for p in repo.pending_inbox()] == [42, 43]
+
+
+def test_an_oversized_body_is_refused_before_it_is_buffered(webhook_app, repo):
+    with TestClient(webhook_app) as client:
+        response = client.post(
+            "/webhooks/github",
+            content=b"{}",
+            headers={
+                "X-GitHub-Event": "issues",
+                "X-GitHub-Delivery": "d-big",
+                "Content-Length": str(50 * 1024 * 1024),
+            },
+        )
+    assert response.status_code == 413
+    assert repo.counters().get("webhook_too_large") == 1

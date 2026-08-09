@@ -172,9 +172,20 @@ def test_an_insight_for_an_unknown_session_is_refused(repo: Repo):
 # --- inbox and deliveries ----------------------------------------------------
 
 
-def test_delivery_ids_are_idempotent(repo: Repo):
-    assert repo.record_delivery("guid", "issues", "labeled") is True
-    assert repo.record_delivery("guid", "issues", "labeled") is False
+def test_a_redelivered_guid_is_refused(repo: Repo):
+    assert repo.record_delivery("guid", "sha-1", "issues", "labeled") is True
+    assert repo.record_delivery("guid", "sha-1", "issues", "labeled") is False
+
+
+def test_a_replayed_body_under_a_new_guid_is_refused(repo: Repo):
+    """The GUID is an unsigned header, so it cannot be the only replay defence."""
+    assert repo.record_delivery("guid-a", "sha-1", "issues", "labeled") is True
+    assert repo.record_delivery("guid-b", "sha-1", "issues", "labeled") is False
+
+
+def test_a_different_body_is_accepted(repo: Repo):
+    assert repo.record_delivery("guid-a", "sha-1", "issues", "labeled") is True
+    assert repo.record_delivery("guid-b", "sha-2", "issues", "labeled") is True
 
 
 def test_inbox_round_trip(repo: Repo):
