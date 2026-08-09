@@ -174,6 +174,25 @@ def test_the_shipped_bounds_are_the_ones_the_readme_documents(tmp_path, monkeypa
     assert settings.pr_stale_hours == 24.0
 
 
+@pytest.mark.parametrize(
+    ("seconds", "rendered"),
+    [
+        (None, "—"),
+        (0.0, "0s"),
+        (45.0, "45s"),
+        (600.0, "10m"),
+        (7200.0, "2.0h"),
+        (259200.0, "3.0d"),
+    ],
+)
+def test_durations_render_in_the_unit_a_reader_expects(seconds, rendered):
+    """This is the MTTR column a VP reads. `None` must be an em dash — rendering it as `0s` claims
+    a measurement that was never taken, which is the one error worth catching here."""
+    from app.main import _fmt_duration
+
+    assert _fmt_duration(seconds) == rendered
+
+
 @pytest.mark.parametrize("headers", [{}, {"X-Admin-Token": "guess"}])
 def test_admin_endpoints_reject_a_bad_token(client, headers):
     assert client.post("/api/admin/issues/5", headers=headers).status_code == 401

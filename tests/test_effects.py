@@ -118,6 +118,21 @@ async def test_a_reason_that_recurs_after_a_human_cleared_it_is_announced_again(
     assert "again" in said[1]
 
 
+async def test_a_create_response_with_no_session_id_is_an_error_not_a_ghost_row(effects):
+    """Recording a session with a `None` id would poll nothing, close nothing and count nothing,
+    while the ACUs it is spending go on being real."""
+    eff, repo, _ = effects
+    repo.register_issue(2, "t", None)
+
+    async def create_session(*args, **kwargs):
+        return {"url": "https://app.devin.ai/sessions/?"}
+
+    eff.devin.create_session = create_session
+    with pytest.raises(RuntimeError, match="no session_id"):
+        await eff.start_session({"number": 2}, attempt=1, prompt="p", title="t", tags=["issue:2"])
+    assert repo.sessions(2) == []
+
+
 async def test_the_same_reason_is_not_re_announced(effects):
     eff, repo, _ = effects
     seed(repo)
