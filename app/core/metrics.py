@@ -22,8 +22,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.core.state import IssueState
-
 
 def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
@@ -92,7 +90,17 @@ def compute(
     m.counters = counters
 
     m.issues_total = len(issues)
-    pr_by_issue = {p["issue_number"]: p for p in pull_requests if p["issue_number"] is not None}
+    # One pull request per issue, preferring a merged one. Devin can open more than one pull
+    # request for an issue; keeping simply the last row reported the issue unresolved even when an
+    # earlier pull request had merged, which silently zeroed the headline number.
+    pr_by_issue: dict[int, dict[str, Any]] = {}
+    for p in pull_requests:
+        key = p["issue_number"]
+        if key is None:
+            continue
+        current = pr_by_issue.get(key)
+        if current is None or (p["merged_at"] and not current["merged_at"]):
+            pr_by_issue[key] = p
 
     resolved = [i for i in issues if (pr_by_issue.get(i["number"]) or {}).get("merged_at")]
     m.issues_resolved = len(resolved)
@@ -123,11 +131,12 @@ def compute(
     # An issue counts as autonomous when no intervention of any kind was recorded against it.
     # Nudges count: an automatic nudge is still the system compensating for a stall.
     touched = {i["issue_number"] for i in interventions if i["issue_number"] is not None}
-    finished_issues = [i for i in issues if i["state"] in (IssueState.MERGED, IssueState.PR_OPEN)]
-    if finished_issues:
-        m.autonomy_rate = sum(1 for i in finished_issues if i["number"] not in touched) / len(
-            finished_issues
-        )
+    # Denominated on the observed outcome — issues that produced a pull request — like every other
+    # rate here. Reading the stored issue state instead made this the one metric with a different
+    # vocabulary, and it returned None whenever that column disagreed with what GitHub showed.
+    delivered = [i for i in issues if i["number"] in pr_by_issue]
+    if delivered:
+        m.autonomy_rate = sum(1 for i in delivered if i["number"] not in touched) / len(delivered)
     if m.issues_resolved:
         m.interventions_per_resolution = len(interventions) / m.issues_resolved
 

@@ -35,14 +35,23 @@ DETAIL_FINISHED = "finished"
 DETAIL_INACTIVITY = "inactivity"
 DETAIL_USER_REQUEST = "user_request"
 
+DETAIL_ERROR = "error"
+
 #: ``suspended`` details that mean a cost or quota ceiling stopped the work. These are the only
 #: suspensions that are genuinely bad news; everything else is sleep.
+#:
+#: The full documented set matters here. A halt this list misses is classified as sleep, so the
+#: orchestrator keeps sending wake-up messages that cannot succeed, never escalates, and shows the
+#: issue as running — the exact failure the cost controls exist to prevent.
 COST_HALT_DETAILS = frozenset(
     {
         "usage_limit_exceeded",
         "org_usage_limit_exceeded",
+        "user_usage_limit_exceeded",
+        "total_session_limit_exceeded",
         "out_of_credits",
         "out_of_quota",
+        "no_quota_allocation",
         "payment_declined",
     }
 )
@@ -64,6 +73,11 @@ class Phase(StrEnum):
 
 #: Phases from which a session cannot come back on its own.
 TERMINAL_PHASES = frozenset({Phase.ENDED, Phase.FAILED})
+
+#: Phases after which polling should stop. ``HALTED_COST`` is included because a quota or credit
+#: ceiling will not lift on its own: the orchestrator has already escalated, and continuing to poll
+#: only burns API calls and inflates counters.
+CLOSED_PHASES = frozenset({Phase.ENDED, Phase.FAILED, Phase.HALTED_COST})
 
 #: Phases in which the session is awake and spending ACUs.
 ACTIVE_PHASES = frozenset({Phase.STARTING, Phase.IN_PROGRESS, Phase.RESUMING})
@@ -99,6 +113,10 @@ def classify(status: str | None, status_detail: str | None) -> Phase:
         case s if s == STATUS_SUSPENDED:
             if status_detail in COST_HALT_DETAILS:
                 return Phase.HALTED_COST
+            if status_detail == DETAIL_ERROR:
+                # `suspended/error` is a documented pair and is not sleep: no message will revive
+                # it, so treating it as wakeable would poll and nudge a dead session forever.
+                return Phase.FAILED
             return Phase.SLEEPING
         case _:
             return Phase.IN_PROGRESS
@@ -153,19 +171,28 @@ ISSUE_TERMINAL = frozenset({IssueState.MERGED, IssueState.FAILED})
 
 
 def issue_state_for(
-    phase: Phase,
+    phase: Phase | None,
     *,
     pr_merged: bool,
     pr_open: bool,
     escalated: bool,
+    has_session: bool = True,
 ) -> IssueState:
-    """Derive the issue-level state. Outcomes observed on GitHub outrank session phase."""
+    """Derive the issue-level state. Outcomes observed on GitHub outrank session phase.
+
+    ``has_session`` distinguishes "no session yet" from "a session that has not started moving".
+    Without it, an issue held back by the concurrency cap displayed as in progress, which is
+    precisely the wrong reading — it is queued, and the queue depth is what an operator needs to
+    see when work is not flowing.
+    """
     if pr_merged:
         return IssueState.MERGED
     if escalated:
         return IssueState.ESCALATED
     if pr_open:
         return IssueState.PR_OPEN
+    if not has_session:
+        return IssueState.PENDING
     if phase is Phase.FAILED:
         return IssueState.FAILED
     if phase in (Phase.BLOCKED, Phase.HALTED_COST):

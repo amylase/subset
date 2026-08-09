@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -172,7 +173,9 @@ def _require_admin(request: Request, token: str | None) -> None:
     expected = request.app.state.settings.admin_token
     if not expected:
         raise HTTPException(status_code=404, detail="admin API disabled (ADMIN_TOKEN unset)")
-    if token != expected:
+    # Constant-time: these endpoints enqueue work and force API calls, and the app is reachable
+    # through the same tunnel as the webhook endpoint.
+    if not hmac.compare_digest(token or "", expected):
         raise HTTPException(status_code=401, detail="bad admin token")
 
 

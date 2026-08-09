@@ -113,6 +113,35 @@ def test_ping_is_answered(webhook_app):
     assert response.status_code == 200
 
 
+def test_the_router_verifies_the_exact_bytes_received(webhook_app, repo):
+    """Signed over the received bytes, not over a re-serialisation of the parsed payload.
+
+    The verify-level test for this is a tautology at the router's expense: every other test here
+    builds its body with ``json.dumps``, so ``json.dumps(json.loads(raw)) == raw`` and a router that
+    verified the re-serialised form would still pass. A real GitHub body is compact and does not
+    survive that round trip, so this case is written as literal bytes.
+    """
+    body = (
+        b'{"action":"labeled",\n  "issue":{"number":42},"label":{"name":"devin-fix"},'
+        b'"repository":{"full_name":"amylase/superset"}}'
+    )
+    assert json.dumps(json.loads(body)).encode() != body
+    signature = "sha256=" + hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+
+    with TestClient(webhook_app) as client:
+        response = client.post(
+            "/webhooks/github",
+            content=body,
+            headers={
+                "X-GitHub-Event": "issues",
+                "X-GitHub-Delivery": "d-raw",
+                "X-Hub-Signature-256": signature,
+            },
+        )
+    assert response.status_code == 202
+    assert [p["payload"] for p in repo.pending_queue()] == [{"number": 42}]
+
+
 def test_missing_delivery_header_is_rejected(webhook_app, repo):
     body = json.dumps(labeled()).encode()
     signature = "sha256=" + hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()

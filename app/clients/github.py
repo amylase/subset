@@ -20,6 +20,26 @@ from app.clients.http import request_with_retry
 
 logger = logging.getLogger(__name__)
 
+#: Check-run conclusions that must not be read as a pass.
+#:
+#: One set, used by both the settled/failed decision and the summary handed to Devin. They were
+#: previously two different sets, which produced a silent dead loop: a ``cancelled`` run made
+#: ``checks_settled`` report failure while ``failed_check_summary`` returned nothing, so the
+#: orchestrator decided CI had failed and then had nothing to say about it, on every poll, forever.
+#:
+#: ``skipped`` and ``neutral`` are deliberately absent — GitHub treats both as non-blocking, and on
+#: Superset's matrix the large majority of runs on any given commit are ``skipped`` by design.
+FAILING_CONCLUSIONS = frozenset(
+    {
+        "failure",
+        "timed_out",
+        "cancelled",
+        "action_required",
+        "stale",
+        "startup_failure",
+    }
+)
+
 
 class GitHubClient:
     def __init__(self, token: str, api_base: str, repo: str, *, on_retry: Any = None) -> None:
@@ -80,33 +100,47 @@ class GitHubClient:
     async def pull_files(self, number: int) -> list[dict[str, Any]]:
         return await self._call("GET", f"/pulls/{number}/files", params={"per_page": 100}) or []
 
-    async def check_runs(self, sha: str) -> dict[str, Any]:
-        return await self._call("GET", f"/commits/{sha}/check-runs", params={"per_page": 100})
+    async def check_runs(self, sha: str) -> list[dict[str, Any]]:
+        """Every check run for a commit, following pagination.
+
+        Paging is not optional here. `apache/superset` reports ``total_count`` near 200 on master
+        while a page holds 100, so reading only the first page hid failures on later pages and
+        reported CI green — which would both skip the self-correction loop and record an MTTR
+        against a pull request whose CI never passed.
+        """
+        runs: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            data = await self._call(
+                "GET", f"/commits/{sha}/check-runs", params={"per_page": 100, "page": page}
+            )
+            batch = data.get("check_runs", [])
+            runs.extend(batch)
+            total = int(data.get("total_count") or 0)
+            if not batch or len(runs) >= total or page >= 20:
+                return runs
+            page += 1
 
     async def failed_check_summary(self, sha: str, *, limit: int = 8) -> list[str]:
-        """Names of failed checks for a commit, for handing back to Devin."""
-        data = await self.check_runs(sha)
-        failed = [
-            run["name"]
-            for run in data.get("check_runs", [])
-            if run.get("conclusion") in ("failure", "timed_out")
-        ]
+        """Names of the checks that did not pass, for handing back to Devin."""
+        runs = await self.check_runs(sha)
+        failed = [run["name"] for run in runs if run.get("conclusion") in FAILING_CONCLUSIONS]
         return failed[:limit]
 
     async def checks_settled(self, sha: str) -> tuple[bool, str]:
         """Whether every check on ``sha`` has finished, and the aggregate conclusion.
 
         Returns ``(settled, conclusion)`` where conclusion is ``success``, ``failure`` or
-        ``pending``. Note that on a fork some checks may never run at all, which is why the
-        baseline recorded in the README matters when reading this.
+        ``pending``. On a fork some checks never run at all, which is why the baseline recorded in
+        the README matters when reading this.
         """
-        data = await self.check_runs(sha)
-        runs = data.get("check_runs", [])
+        runs = await self.check_runs(sha)
         if not runs:
+            # No checks is not success. Fabricating green here would inflate the first-pass rate
+            # and merge pull requests nothing ever verified.
             return False, "pending"
         if any(run.get("status") != "completed" for run in runs):
             return False, "pending"
-        bad = {"failure", "timed_out", "cancelled"}
-        if any(run.get("conclusion") in bad for run in runs):
+        if any(run.get("conclusion") in FAILING_CONCLUSIONS for run in runs):
             return True, "failure"
         return True, "success"

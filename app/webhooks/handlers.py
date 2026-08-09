@@ -11,7 +11,26 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.clients.github import FAILING_CONCLUSIONS
+
 Intent = tuple[str, dict[str, Any]] | None
+
+#: Who may put text in front of Devin.
+#:
+#: Anything forwarded to a session reaches an agent holding a checked-out working tree and push
+#: rights on the repository, so the forwarding paths are an instruction channel, not a comment feed.
+#: The fork is public: without this gate any account could comment on an open remediation pull
+#: request and have that text delivered to the agent. ``author_association`` is already present in
+#: every comment payload.
+TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+
+#: Untrusted text is truncated before it is forwarded. A long comment is not a useful instruction
+#: and a very long one is a way to push the real task out of the agent's attention.
+MAX_FORWARDED_CHARS = 4000
+
+
+def _is_trusted(comment: dict[str, Any]) -> bool:
+    return comment.get("author_association") in TRUSTED_ASSOCIATIONS
 
 
 def to_intent(event: str, payload: dict[str, Any], *, trigger_label: str) -> Intent:
@@ -42,12 +61,15 @@ def _issue_comment(payload: dict[str, Any]) -> Intent:
     """A human answering a question the orchestrator escalated.
 
     Bot comments are skipped, otherwise the orchestrator's own write-back would be forwarded to
-    Devin as if it were a human reply.
+    Devin as if it were a human reply. Only trusted associations are forwarded — see
+    :data:`TRUSTED_ASSOCIATIONS`.
     """
     if payload.get("action") != "created":
         return None
     comment = payload.get("comment") or {}
     if (comment.get("user") or {}).get("type") == "Bot":
+        return None
+    if not _is_trusted(comment):
         return None
     body = (comment.get("body") or "").strip()
     if not body:
@@ -55,7 +77,7 @@ def _issue_comment(payload: dict[str, Any]) -> Intent:
     return "issue_comment", {
         "issue_number": payload["issue"]["number"],
         "author": (comment.get("user") or {}).get("login", "unknown"),
-        "comment": body,
+        "comment": body[:MAX_FORWARDED_CHARS],
     }
 
 
@@ -68,7 +90,9 @@ def _workflow_run(payload: dict[str, Any]) -> Intent:
     if payload.get("action") != "completed":
         return None
     run = payload.get("workflow_run") or {}
-    if run.get("conclusion") not in ("failure", "timed_out"):
+    # Same set the check-run reader uses. `startup_failure` matters in particular: it is what a
+    # malformed workflow file produces, and it used to be read as a pass.
+    if run.get("conclusion") not in FAILING_CONCLUSIONS:
         return None
     pulls = run.get("pull_requests") or []
     if not pulls:
@@ -81,15 +105,25 @@ def _workflow_run(payload: dict[str, Any]) -> Intent:
 
 
 def _review_comment(payload: dict[str, Any]) -> Intent:
+    """Reviewer feedback on a remediation pull request.
+
+    Same trust gate as issue comments. This path used to accept any non-bot commenter, which on a
+    public fork meant anyone could send instructions to an agent with push rights.
+    """
     if payload.get("action") != "created":
         return None
     comment = payload.get("comment") or {}
     if (comment.get("user") or {}).get("type") == "Bot":
         return None
+    if not _is_trusted(comment):
+        return None
+    body = (comment.get("body") or "").strip()
+    if not body:
+        return None
     return "review_comment", {
         "pr_number": payload["pull_request"]["number"],
         "reviewer": (comment.get("user") or {}).get("login", "unknown"),
-        "comment": (comment.get("body") or "").strip(),
+        "comment": body[:MAX_FORWARDED_CHARS],
     }
 
 

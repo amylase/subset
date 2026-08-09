@@ -43,6 +43,16 @@ class Settings(BaseSettings):
     max_nudges: int = 2
     max_ci_feedback_rounds: int = 3
 
+    #: How long to leave a session alone after sending it anything. A session needs a moment to act
+    #: on a message before its state means anything again; without this the loop re-reads a stale
+    #: `waiting_for_user` and escalates a session it has just unblocked.
+    message_grace_seconds: float = 120.0
+
+    #: Backstop for a session that never reaches a phase the loop recognises as an ending — an
+    #: unrecognised status, or one that sleeps forever having produced nothing. Without it such a
+    #: session holds a concurrency slot and is polled indefinitely.
+    max_session_age_hours: float = 12.0
+
     # --- loop cadence (seconds) -------------------------------------------
     session_poll_interval: float = 10.0
     pr_poll_interval: float = 60.0

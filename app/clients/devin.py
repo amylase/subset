@@ -172,7 +172,7 @@ def collection_items(response: Any) -> list[dict[str, Any]]:
     a bare list too, so a shape change degrades to empty rather than raising.
     """
     if isinstance(response, dict):
-        for key in ("items", "playbooks", "schedules", "sessions"):
+        for key in ("items", "playbooks", "schedules", "sessions", "messages"):
             value = response.get(key)
             if isinstance(value, list):
                 return [v for v in value if isinstance(v, dict)]
@@ -186,19 +186,26 @@ def last_devin_message(messages: Any) -> str:
     """Extract the most recent Devin-authored message text.
 
     Used to find out *what* a blocked session asked, so the escalation comment on the issue carries
-    the question rather than just a link. Tolerant of shape changes: the message list format is not
-    fully specified in the docs, so anything unrecognised degrades to an empty string.
+    the question rather than only a link.
+
+    The real response is ``{"items": [{"event_id", "source", "message", "created_at"}], ...}``:
+    rows sit under ``items`` (not ``messages``) and authorship is ``source`` with values ``devin``
+    and ``user`` (there is no ``type`` field). An earlier version guessed both names, so it matched
+    nothing and returned the empty string on every call against the live API — the "tolerant
+    degradation" was the only path that ever ran.
+
+    Messages are ordered oldest-first, so the newest Devin turn is found from the end.
+    ``created_at``
+    is used to order defensively rather than trusting position.
     """
-    items = messages.get("messages") if isinstance(messages, dict) else messages
-    if not isinstance(items, list):
+    items = collection_items(messages)
+    if not items:
         return ""
-    for item in reversed(items):
-        if not isinstance(item, dict):
+    ordered = sorted(items, key=lambda item: item.get("created_at") or 0)
+    for item in reversed(ordered):
+        if item.get("source") != "devin":
             continue
-        if item.get("type") in ("user_message", "user"):
-            continue
-        for key in ("message", "text", "content"):
-            value = item.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+        value = item.get("message")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return ""

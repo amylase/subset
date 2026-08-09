@@ -38,15 +38,33 @@ class Repo:
     def _conn(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path, timeout=15)
         conn.row_factory = sqlite3.Row
+        # `PRAGMA foreign_keys` is per-connection, not persisted like `journal_mode`. Setting it
+        # only in init_schema left every other connection with foreign keys disabled.
+        conn.execute("PRAGMA foreign_keys = ON")
         try:
             yield conn
             conn.commit()
         finally:
             conn.close()
 
+    #: Columns added after the first release. ``CREATE TABLE IF NOT EXISTS`` cannot introduce a
+    #: column into a database that already exists, so they are applied additively at startup.
+    _MIGRATIONS = (
+        ("sessions", "reported_at", "REAL"),
+        ("sessions", "last_message_at", "REAL"),
+        ("sessions", "closed_at", "REAL"),
+        ("pull_requests", "ci_feedback_sha", "TEXT"),
+        ("queue", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("queue", "last_error", "TEXT"),
+    )
+
     def init_schema(self) -> None:
         with self._conn() as conn:
             conn.executescript(_SCHEMA.read_text(encoding="utf-8"))
+            for table, column, decl in self._MIGRATIONS:
+                existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")  # noqa: S608
 
     def bump(self, name: str, amount: float = 1) -> None:
         """Increment an operational counter."""
@@ -98,6 +116,25 @@ class Repo:
         with self._conn() as conn:
             conn.execute("UPDATE queue SET dispatched_at = ? WHERE id = ?", (now(), queue_id))
 
+    def record_queue_failure(self, queue_id: int, error: str, *, max_attempts: int) -> bool:
+        """Record a failed dispatch. Returns ``True`` if the item is now exhausted.
+
+        An item is retried rather than dropped. ``issue_comment`` and ``review_comment`` have no
+        other source — no polling pass re-derives them — so discarding one on a transient API
+        error loses a human's answer permanently.
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                "UPDATE queue SET attempts = attempts + 1, last_error = ? WHERE id = ? "
+                "RETURNING attempts",
+                (error[:500], queue_id),
+            ).fetchone()
+            attempts = int(row["attempts"]) if row else max_attempts
+            if attempts >= max_attempts:
+                conn.execute("UPDATE queue SET dispatched_at = ? WHERE id = ?", (now(), queue_id))
+                return True
+            return False
+
     # --- issues ------------------------------------------------------------
 
     def upsert_issue(self, number: int, title: str, klass: str | None, labeled_at: float) -> bool:
@@ -114,11 +151,40 @@ class Repo:
             )
             return cur.rowcount == 1
 
-    def set_issue_state(self, number: int, state: str) -> None:
+    #: Once an issue reaches one of these, session-derived state must not move it. A merged pull
+    #: request is the outcome; a session that later errors or is cancelled does not un-merge it.
+    _STICKY_ISSUE_STATES = ("merged",)
+
+    def set_issue_state(self, number: int, state: str, *, force: bool = False) -> bool:
+        """Set issue state. Returns ``True`` if it was written.
+
+        Refuses to move an issue out of a sticky terminal state unless ``force`` is given, so a
+        late session transition cannot overwrite a recorded outcome and desynchronise the metrics
+        from the dashboard.
+        """
         with self._conn() as conn:
-            conn.execute(
-                "UPDATE issues SET state = ?, updated_at = ? WHERE number = ?",
-                (state, now(), number),
+            placeholders = ",".join("?" * len(self._STICKY_ISSUE_STATES))
+            sql = "UPDATE issues SET state = ?, updated_at = ? WHERE number = ?"
+            args: tuple[Any, ...] = (state, now(), number)
+            if not force:
+                sql += f" AND state NOT IN ({placeholders})"  # noqa: S608
+                args += self._STICKY_ISSUE_STATES
+            return conn.execute(sql, args).rowcount == 1
+
+    def reopen_issue(self, number: int) -> bool:
+        """Return a stalled issue to ``pending`` so a new session can be started for it.
+
+        Without this there is no path back: ``upsert_issue`` is ``INSERT OR IGNORE``, so re-applying
+        the label to an issue whose session errored is a no-op and the issue is stuck forever.
+        """
+        with self._conn() as conn:
+            return (
+                conn.execute(
+                    "UPDATE issues SET state = 'pending', updated_at = ? "
+                    "WHERE number = ? AND state IN ('failed', 'escalated')",
+                    (now(), number),
+                ).rowcount
+                == 1
             )
 
     def issues(self, state: str | None = None) -> list[dict[str, Any]]:
@@ -160,12 +226,25 @@ class Repo:
         structured_output: Any | None = None,
         blocked: bool = False,
         finished: bool = False,
+        closed: bool = False,
     ) -> bool:
         """Persist a poll result. Returns ``True`` when the status pair changed.
 
-        ``ever_blocked`` is sticky: a session that stopped to ask a question decays into
-        ``suspended/inactivity`` once it sleeps, so the blocked observation has to be latched or it
-        is lost between polls.
+        Three fields are deliberately monotonic:
+
+        ``ever_blocked`` — a session that stopped to ask a question decays into
+        ``suspended/inactivity`` once it sleeps, so the blocked observation must be latched or it is
+        lost between polls.
+
+        ``finished_at`` — written once, when the session has produced its work product.
+
+        ``closed_at`` — written once, when the session can no longer be revived at all. Kept
+        separate: a session that opened a pull request and went to sleep is finished but still
+        wakeable, and the review-fix loop depends on being able to message it.
+
+        ``acus`` — takes the maximum rather than the last value. A poll whose payload omits
+        ``acus_consumed`` would otherwise erase recorded spend, understating cost and re-opening the
+        global budget. Devin's ACU counter only ever grows, so ``MAX`` is the faithful reading.
         """
         ts = now()
         with self._conn() as conn:
@@ -173,12 +252,16 @@ class Repo:
                 "SELECT status, status_detail, finished_at FROM sessions WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
-            changed = bool(row) and (row["status"], row["status_detail"]) != (status, status_detail)
+            if row is None:
+                raise KeyError(f"no such session: {session_id}")
+            changed = (row["status"], row["status_detail"]) != (status, status_detail)
             conn.execute(
-                "UPDATE sessions SET status = ?, status_detail = ?, acus = ?, updated_at = ?,"
+                "UPDATE sessions SET status = ?, status_detail = ?, acus = MAX(acus, ?),"
+                " updated_at = ?,"
                 " ever_blocked = MAX(ever_blocked, ?),"
                 " structured_output = COALESCE(?, structured_output),"
-                " finished_at = COALESCE(finished_at, ?)"
+                " finished_at = COALESCE(finished_at, ?),"
+                " closed_at = COALESCE(closed_at, ?)"
                 " WHERE session_id = ?",
                 (
                     status,
@@ -188,6 +271,7 @@ class Repo:
                     1 if blocked else 0,
                     json.dumps(structured_output) if structured_output is not None else None,
                     ts if finished else None,
+                    ts if closed else None,
                     session_id,
                 ),
             )
@@ -207,6 +291,46 @@ class Repo:
             conn.execute(
                 f"UPDATE sessions SET {column} = {column} + 1 WHERE session_id = ?",  # noqa: S608
                 (session_id,),
+            )
+
+    def mark_message_sent(self, session_id: str) -> None:
+        """Stamp the grace-period anchor after sending anything to a session.
+
+        The loop must not nudge or escalate a session that has not yet had a chance to act on the
+        last message. Without this, forwarding a human's answer is immediately followed — in the
+        same tick — by another escalation, because the session still reads ``waiting_for_user``.
+        """
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE sessions SET last_message_at = ? WHERE session_id = ?", (now(), session_id)
+            )
+
+    def close_session(self, session_id: str) -> bool:
+        """Stop tracking a session. Used by the watchdog for what the phases do not cover."""
+        with self._conn() as conn:
+            return (
+                conn.execute(
+                    "UPDATE sessions SET closed_at = ? WHERE session_id = ? AND closed_at IS NULL",
+                    (now(), session_id),
+                ).rowcount
+                == 1
+            )
+
+    def clear_nudges(self, session_id: str) -> None:
+        """Reset the nudge budget, used when a human takes over and hands back."""
+        with self._conn() as conn:
+            conn.execute("UPDATE sessions SET nudges = 0 WHERE session_id = ?", (session_id,))
+
+    def mark_reported(self, session_id: str) -> bool:
+        """Claim the right to write the completion comment. ``True`` for the first caller only."""
+        with self._conn() as conn:
+            return (
+                conn.execute(
+                    "UPDATE sessions SET reported_at = ? "
+                    "WHERE session_id = ? AND reported_at IS NULL",
+                    (now(), session_id),
+                ).rowcount
+                == 1
             )
 
     def sessions(self, issue_number: int | None = None) -> list[dict[str, Any]]:
@@ -289,6 +413,7 @@ class Repo:
             "ci_settled_at",
             "ci_conclusion",
             "ci_attempts",
+            "ci_feedback_sha",
             "issue_number",
             "session_id",
         }
@@ -317,11 +442,24 @@ class Repo:
                 )
             ]
 
+    def pull_request(self, pr_number: int) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM pull_requests WHERE pr_number = ?", (pr_number,)
+            ).fetchone()
+            return dict(row) if row else None
+
     def pr_for_issue(self, issue_number: int) -> dict[str, Any] | None:
+        """The pull request that represents this issue's outcome.
+
+        A merged one wins over a newer unmerged one. Devin can open more than one pull request for
+        an issue, and taking simply the highest number reported the issue as unresolved even though
+        an earlier pull request had merged.
+        """
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT * FROM pull_requests WHERE issue_number = ?"
-                " ORDER BY pr_number DESC LIMIT 1",
+                " ORDER BY (merged_at IS NOT NULL) DESC, pr_number DESC LIMIT 1",
                 (issue_number,),
             ).fetchone()
             return dict(row) if row else None

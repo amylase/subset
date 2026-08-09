@@ -6,6 +6,8 @@ per session instead of per issue, and excluding failed work from cost.
 
 from __future__ import annotations
 
+import pytest
+
 from app.core.metrics import compute
 
 HOUR = 3600.0
@@ -134,16 +136,35 @@ def test_autonomy_rate_counts_nudges_as_intervention():
 
 
 def test_merge_rate_is_over_opened_pull_requests():
+    """Asymmetric on purpose: 3 issues, 2 opened pull requests, 1 merged.
+
+    With equal counts both candidate denominators give the same answer, so the test could not
+    distinguish the property it claims to pin.
+    """
     m = make(
-        issues=[issue(1), issue(2, state="pr_open")],
+        issues=[issue(1), issue(2, state="pr_open"), issue(3, state="pending")],
         sessions=[session("s1", 1, 4), session("s2", 2, 4)],
         pulls=[
             pull(10, 1, "s1", opened=HOUR, merged=2 * HOUR),
             pull(11, 2, "s2", opened=HOUR),
         ],
     )
-    assert m.merge_rate == 0.5
-    assert m.resolution_rate == 0.5
+    assert m.merge_rate == 0.5  # merged / opened PRs
+    assert m.resolution_rate == pytest.approx(1 / 3)  # resolved / issues
+
+
+def test_the_merged_pull_request_wins_when_an_issue_has_two():
+    """Keeping simply the last row reported a resolved issue as unresolved."""
+    m = make(
+        issues=[issue(1)],
+        sessions=[session("s1", 1, 6)],
+        pulls=[
+            pull(10, 1, "s1", opened=HOUR, merged=2 * HOUR),
+            pull(11, 1, "s1", opened=3 * HOUR),
+        ],
+    )
+    assert m.issues_resolved == 1
+    assert m.resolution_rate == 1.0
 
 
 def test_ci_first_pass_rate_excludes_pull_requests_that_needed_the_fix_loop():
