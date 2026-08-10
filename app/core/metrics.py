@@ -68,7 +68,9 @@ class Metrics:
     acus_total: float = 0.0
     acus_wasted: float = 0.0
     cost_per_resolution_usd: float | None = None
-    cost_total_usd: float = 0.0
+    #: `None`, not 0.0, when no session reported any consumption — "not measured" and "free" are
+    #: different claims and only one of them is true.
+    cost_total_usd: float | None = None
     engineer_hours_saved: float | None = None
 
     # tier 2 -- operational
@@ -159,9 +161,18 @@ def compute(
     m.acus_wasted = sum(
         float(s["acus"] or 0) for s in sessions if s["session_id"] not in merged_session_ids
     )
-    m.cost_total_usd = m.acus_total * acu_unit_cost_usd
+    # Sessions that did real work and report zero ACU are missing data, not free work — this run
+    # produced four merged pull requests and the Analytics endpoint returned 0 for every one of
+    # them. Reporting "$0.00" there states a measurement that was never taken, which is the same
+    # error as rendering an absent duration as `0s`. Left as `None`, it renders as an em dash.
+    measured = m.acus_total > 0
+    if measured:
+        m.cost_total_usd = m.acus_total * acu_unit_cost_usd
     if m.issues_resolved:
-        m.cost_per_resolution_usd = m.cost_total_usd / m.issues_resolved
+        if measured:
+            m.cost_per_resolution_usd = m.cost_total_usd / m.issues_resolved
+        # Not derived from ACUs — it is the stated manual-effort assumption, and it stands whether
+        # or not Devin reported its consumption.
         m.engineer_hours_saved = m.issues_resolved * manual_effort_hours_per_issue
 
     # --- durations ---------------------------------------------------------

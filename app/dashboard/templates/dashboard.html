@@ -99,7 +99,13 @@
     <div class="tile">
       <div class="label">Cost per resolution</div>
       <div class="value">{{ m.cost_per_resolution_usd | usd }}</div>
-      <div class="note">{{ "%.1f"|format(m.acus_total) }} ACU total, incl. {{ "%.1f"|format(m.acus_wasted) }} not merged</div>
+      <div class="note">
+        {%- if m.acus_total > 0 -%}
+        {{ "%.1f"|format(m.acus_total) }} ACU total, incl. {{ "%.1f"|format(m.acus_wasted) }} not merged
+        {%- else -%}
+        no ACU reported for any session — not measured, not free
+        {%- endif -%}
+      </div>
     </div>
     <div class="tile">
       <div class="label">Autonomy rate</div>

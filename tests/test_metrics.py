@@ -205,6 +205,22 @@ def test_devin_turns_per_resolution():
     assert m.devin_turns_per_resolution == 12
 
 
+def test_sessions_that_report_no_acus_leave_cost_unmeasured():
+    """Devin's Analytics endpoint returned 0 ACU for every session on the real run, including ones
+    that produced merged pull requests. Multiplying that by a rate gives `$0.00`, which reads as
+    "this was free" — a claim nobody made. It is the same error as rendering an absent duration as
+    `0s`, and the fix is the same: leave it absent."""
+    m = make(
+        view=[row(1)],
+        sessions=[session("s1", 0.0)],
+        pulls=[pull(10, 1, "s1", opened=HOUR, merged=2 * HOUR)],
+    )
+    assert m.issues_resolved == 1, "the work happened"
+    assert m.cost_per_resolution_usd is None
+    assert m.cost_total_usd is None
+    assert m.engineer_hours_saved == 4.0, "the manual-effort assumption does not depend on ACUs"
+
+
 def test_empty_state_reports_none_rather_than_zero():
     """A rate of 0% over no data is a lie; an absent value is honest."""
     m = make()
